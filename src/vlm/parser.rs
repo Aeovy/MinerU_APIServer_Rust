@@ -302,12 +302,7 @@ fn render_pdf_pages(
     end_page_id: usize,
     processing_window_size: usize,
 ) -> ApiResult<Vec<DynamicImage>> {
-    let bindings = Pdfium::bind_to_system_library().map_err(|error| {
-        ApiError::Internal(format!(
-            "Failed to bind PDFium system library: {error}. Install PDFium or set the platform library path."
-        ))
-    })?;
-    let pdfium = Pdfium::new(bindings);
+    let pdfium = bind_pdfium()?;
     let document = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .map_err(|error| ApiError::BadRequest(format!("Failed to open PDF: {error}")))?;
@@ -339,6 +334,14 @@ fn render_pdf_pages(
         }
     }
     Ok(images)
+}
+
+fn bind_pdfium() -> ApiResult<Pdfium> {
+    pdfium_auto::bind_bundled().map_err(|error| {
+        ApiError::Internal(format!(
+            "Failed to bind bundled PDFium library: {error}. Rebuild the project so pdfium-auto can install the platform PDFium binary."
+        ))
+    })
 }
 
 fn prepare_layout_image(image: &DynamicImage) -> ApiResult<DynamicImage> {

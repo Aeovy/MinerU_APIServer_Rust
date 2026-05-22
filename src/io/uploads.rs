@@ -31,13 +31,14 @@ impl UploadStore {
     /// - `field`: multipart file field named `files`.
     pub async fn save_field(&self, mut field: Field<'_>) -> ApiResult<StoredUpload> {
         fs::create_dir_all(&self.upload_dir).await?;
-        let original_name = field
-            .file_name()
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("upload-{}", uuid::Uuid::new_v4()));
+        let original_name = field.file_name().map(ToOwned::to_owned).ok_or_else(|| {
+            ApiError::BadRequest(
+                "Field 'files' must be uploaded as a file. Use curl syntax like -F 'files=@/path/to/document.pdf;type=application/pdf'.".to_string(),
+            )
+        })?;
         let filename = normalize_upload_filename(&original_name);
         let suffix = file_suffix(&filename)
-            .ok_or_else(|| ApiError::BadRequest("Unsupported file type: ".to_string()))?;
+            .ok_or_else(|| ApiError::BadRequest(format!("Unsupported file type: {filename}")))?;
         if !SUPPORTED_SUFFIXES.contains(&suffix.as_str()) {
             return Err(ApiError::BadRequest(format!(
                 "Unsupported file type: {suffix}"

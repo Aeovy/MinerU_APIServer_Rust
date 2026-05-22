@@ -15,6 +15,7 @@ futures = "0.3"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 mime_guess = "2.0"
 pdfium-render = "0.8"
+pdfium-auto = { version = "0.3.0", features = ["bundled"] }
 regex = "1.11"
 reqwest = { version = "0.13", default-features = false, features = ["json", "multipart", "rustls"] }
 secrecy = "0.10"
