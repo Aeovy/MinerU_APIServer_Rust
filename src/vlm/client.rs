@@ -1,8 +1,9 @@
 use std::{env, sync::OnceLock, time::Duration};
 
+use async_openai::{config::Config, Client};
 use base64::{engine::general_purpose::STANDARD, Engine};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-use serde::Deserialize;
+use reqwest::header::{HeaderMap, AUTHORIZATION};
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 
 use crate::error::{ApiError, ApiResult};
@@ -10,6 +11,51 @@ use crate::error::{ApiError, ApiResult};
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 const DEFAULT_USER_PROMPT: &str = "What is the text in the illustrate?";
 const END_TOKEN_ENV: &str = "MINERU_VLM_END_TOKEN";
+
+#[derive(Debug, Clone)]
+struct MineruOpenAiConfig {
+    api_base: String,
+    api_key: SecretString,
+}
+
+impl MineruOpenAiConfig {
+    fn new(base_url: &str, api_key: Option<&str>) -> Self {
+        Self {
+            api_base: format!("{}/v1", base_url.trim_end_matches('/')),
+            api_key: api_key.unwrap_or_default().to_string().into(),
+        }
+    }
+}
+
+impl Config for MineruOpenAiConfig {
+    fn headers(&self) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        let api_key = self.api_key.expose_secret();
+        if !api_key.is_empty() {
+            let value = format!("Bearer {api_key}");
+            if let Ok(header_value) = value.parse() {
+                headers.insert(AUTHORIZATION, header_value);
+            }
+        }
+        headers
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{}", self.api_base, path)
+    }
+
+    fn query(&self) -> Vec<(&str, &str)> {
+        Vec::new()
+    }
+
+    fn api_base(&self) -> &str {
+        &self.api_base
+    }
+
+    fn api_key(&self) -> &SecretString {
+        &self.api_key
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
@@ -49,23 +95,14 @@ pub struct VlmRequest {
 
 #[derive(Clone)]
 pub struct VlmHttpClient {
-    client: reqwest::Client,
+    http_client: reqwest::Client,
+    api_key: Option<String>,
 }
 
 impl VlmHttpClient {
     pub fn new() -> Self {
-        let mut headers = HeaderMap::new();
-        if let Ok(api_key) = env::var("MINERU_VL_API_KEY") {
-            let trimmed = api_key.trim();
-            if !trimmed.is_empty() {
-                let value = format!("Bearer {trimmed}");
-                if let Ok(header_value) = HeaderValue::from_str(&value) {
-                    headers.insert(AUTHORIZATION, header_value);
-                }
-            }
-        }
-        let client = reqwest::Client::builder()
-            .default_headers(headers)
+        let api_key = read_optional_env("MINERU_VL_API_KEY");
+        let http_client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(read_u64_env(
                 "MINERU_HTTP_TIMEOUT",
@@ -73,7 +110,10 @@ impl VlmHttpClient {
             )))
             .build()
             .expect("reqwest client configuration must be valid");
-        Self { client }
+        Self {
+            http_client,
+            api_key,
+        }
     }
 
     /// Send an OpenAI-compatible chat completion request for one MinerU VLM step.
@@ -84,26 +124,11 @@ impl VlmHttpClient {
         let base_url = resolve_server_url(request.server_url.as_deref())?;
         let model_name = self.resolve_model_name(&base_url).await?;
         let body = build_chat_body(&model_name, &request);
-        let response = self
-            .client
-            .post(format!("{base_url}/v1/chat/completions"))
-            .json(&body)
-            .send()
+        let data: Value = self
+            .openai_client(&base_url)
+            .chat()
+            .create_byot(body)
             .await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            return Err(ApiError::Internal(format!(
-                "Unexpected status code: [{}], response body: {}",
-                status.as_u16(),
-                text
-            )));
-        }
-        let data: Value = serde_json::from_str(&text).map_err(|error| {
-            ApiError::Internal(format!(
-                "Failed to parse response JSON: {error}, response body: {text}"
-            ))
-        })?;
         parse_chat_content(&data)
     }
 
@@ -115,67 +140,45 @@ impl VlmHttpClient {
                 return Ok(trimmed.to_string());
             }
         }
-        let response = self
-            .client
-            .get(format!("{base_url}/v1/models"))
-            .send()
-            .await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            return Err(ApiError::Internal(format!(
-                "Failed to get model name from {base_url}. Status code: {}, response body: {text}",
-                status.as_u16()
-            )));
-        }
-        let payload: ModelsResponse = serde_json::from_str(&text).map_err(|_| {
-            ApiError::Internal(format!(
-                "No models found in response from {base_url}. Response body: {text}"
-            ))
-        })?;
-        if payload.data.len() != 1 {
+        let payload = self.list_models(base_url).await?;
+        let models = model_list_from_payload(base_url, &payload)?;
+        if models.len() != 1 {
             return Err(ApiError::BadRequest(format!(
                 "Expected exactly one model from {base_url}, but got {}. Please specify the model name or set the `MINERU_VL_MODEL_NAME` environment variable.",
-                payload.data.len()
+                models.len()
             )));
         }
-        payload
-            .data
+        models
             .first()
-            .map(|model| model.id.clone())
+            .map(ToOwned::to_owned)
             .filter(|id| !id.is_empty())
             .ok_or_else(|| {
                 ApiError::BadRequest(format!(
-                    "Model name is empty in response from {base_url}. Response body: {text}"
+                    "Model name is empty in response from {base_url}. Response body: {payload}"
                 ))
             })
     }
 
     async fn check_model_name(&self, base_url: &str, model_name: &str) -> ApiResult<()> {
-        let response = self
-            .client
-            .get(format!("{base_url}/v1/models"))
-            .send()
-            .await?;
-        let status = response.status();
-        let text = response.text().await?;
-        if !status.is_success() {
-            return Err(ApiError::Internal(format!(
-                "Failed to get model name from {base_url}. Status code: {}, response body: {text}",
-                status.as_u16()
-            )));
-        }
-        let payload: ModelsResponse = serde_json::from_str(&text).map_err(|_| {
-            ApiError::Internal(format!(
-                "No models found in response from {base_url}. Response body: {text}"
-            ))
-        })?;
-        if payload.data.iter().any(|model| model.id == model_name) {
+        let payload = self.list_models(base_url).await?;
+        let models = model_list_from_payload(base_url, &payload)?;
+        if models.iter().any(|id| id == model_name) {
             return Ok(());
         }
         Err(ApiError::BadRequest(format!(
             "Model '{model_name}' not found in the response from {base_url}/v1/models. Please check if the model is available on the server."
         )))
+    }
+
+    async fn list_models(&self, base_url: &str) -> ApiResult<Value> {
+        Ok(self.openai_client(base_url).models().list_byot().await?)
+    }
+
+    fn openai_client(&self, base_url: &str) -> Client<MineruOpenAiConfig> {
+        Client::build(
+            self.http_client.clone(),
+            MineruOpenAiConfig::new(base_url, self.api_key.as_deref()),
+        )
     }
 }
 
@@ -240,6 +243,7 @@ pub fn parse_chat_content(data: &Value) -> ApiResult<String> {
 }
 
 fn build_chat_body(model_name: &str, request: &VlmRequest) -> Value {
+    let model_is_gpt = model_name.to_ascii_lowercase().starts_with("gpt");
     let mut user_content = Vec::new();
     if let Some(image_png) = &request.image_png {
         user_content.push(json!({
@@ -257,25 +261,32 @@ fn build_chat_body(model_name: &str, request: &VlmRequest) -> Value {
         "messages": [
             { "role": "system", "content": DEFAULT_SYSTEM_PROMPT },
             { "role": "user", "content": user_content }
-        ],
-        "skip_special_tokens": false
+        ]
     });
     let object = body.as_object_mut().expect("body is an object");
-    insert_sampling_params(object, &request.sampling_params);
+    insert_sampling_params(object, &request.sampling_params, model_is_gpt);
     if let Some(priority) = request.priority {
         object.insert("priority".to_string(), json!(priority));
     }
     body
 }
 
-fn insert_sampling_params(object: &mut serde_json::Map<String, Value>, params: &SamplingParams) {
+fn insert_sampling_params(
+    object: &mut serde_json::Map<String, Value>,
+    params: &SamplingParams,
+    model_is_gpt: bool,
+) {
     if let Some(value) = params.temperature {
         object.insert("temperature".to_string(), json!(value));
     }
     if let Some(value) = params.top_p {
         object.insert("top_p".to_string(), json!(value));
     }
-    if let Some(value) = params.top_k {
+    if !model_is_gpt {
+        object.insert("skip_special_tokens".to_string(), json!(false));
+    }
+    if !model_is_gpt && params.top_k.is_some() {
+        let value = params.top_k.expect("checked above");
         object.insert("top_k".to_string(), json!(value));
     }
     if let Some(value) = params.presence_penalty {
@@ -284,7 +295,8 @@ fn insert_sampling_params(object: &mut serde_json::Map<String, Value>, params: &
     if let Some(value) = params.frequency_penalty {
         object.insert("frequency_penalty".to_string(), json!(value));
     }
-    if let Some(value) = params.repetition_penalty {
+    if !model_is_gpt && params.repetition_penalty.is_some() {
+        let value = params.repetition_penalty.expect("checked above");
         object.insert("repetition_penalty".to_string(), json!(value));
     }
     if let Some(value) = params.no_repeat_ngram_size {
@@ -335,14 +347,31 @@ fn read_u64_env(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-#[derive(Debug, Deserialize)]
-struct ModelsResponse {
-    data: Vec<ModelInfo>,
+fn read_optional_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
-#[derive(Debug, Deserialize)]
-struct ModelInfo {
-    id: String,
+fn model_list_from_payload(base_url: &str, payload: &Value) -> ApiResult<Vec<String>> {
+    let models = payload
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ApiError::Internal(format!(
+                "No models found in response from {base_url}. Response body: {payload}"
+            ))
+        })?;
+    Ok(models
+        .iter()
+        .filter_map(|model| {
+            model
+                .get("id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .collect())
 }
 
 #[cfg(test)]

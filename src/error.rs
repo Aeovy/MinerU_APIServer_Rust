@@ -53,6 +53,12 @@ impl From<reqwest::Error> for ApiError {
     }
 }
 
+impl From<async_openai::error::OpenAIError> for ApiError {
+    fn from(error: async_openai::error::OpenAIError) -> Self {
+        Self::Internal(error.to_string())
+    }
+}
+
 impl From<serde_json::Error> for ApiError {
     fn from(error: serde_json::Error) -> Self {
         Self::Internal(error.to_string())
