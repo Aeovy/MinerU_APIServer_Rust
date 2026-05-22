@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -30,12 +30,12 @@ impl Default for ParseOptions {
     fn default() -> Self {
         Self {
             lang_list: vec!["ch".to_string()],
-            backend: "hybrid-auto-engine".to_string(),
+            backend: read_string_env("MINERU_API_DEFAULT_BACKEND", "vlm-http-client"),
             parse_method: "auto".to_string(),
             formula_enable: true,
             table_enable: true,
             image_analysis: true,
-            server_url: None,
+            server_url: read_optional_string_env("MINERU_API_DEFAULT_SERVER_URL"),
             return_md: true,
             return_middle_json: false,
             return_model_output: false,
@@ -50,7 +50,7 @@ impl Default for ParseOptions {
 }
 
 impl ParseOptions {
-    /// Validate options supported by the Rust native vlm-http-client implementation.
+    /// Validate options supported by the Rust native VLM HTTP client implementation.
     ///
     /// Inputs:
     /// - `self`: parsed multipart form options.
@@ -58,7 +58,7 @@ impl ParseOptions {
         if !matches!(self.parse_method.as_str(), "auto" | "txt" | "ocr") {
             return Err("Invalid parse_method. Allowed values: auto, ocr, txt".to_string());
         }
-        if self.backend != "vlm-http-client" {
+        if !is_vlm_http_client_backend(&self.backend) {
             return Err(format!(
                 "Unsupported backend: {}. Rust native service currently supports vlm-http-client only.",
                 self.backend
@@ -76,6 +76,35 @@ impl ParseOptions {
             .map(str::trim)
             .is_some_and(|value| !value.is_empty())
     }
+
+    /// Normalize supported backend aliases to the MinerU API backend name.
+    ///
+    /// Inputs:
+    /// - `self`: parsed multipart form options before task creation.
+    pub fn normalize_backend_alias(&mut self) {
+        if self.backend == "vllm-http-client" {
+            self.backend = "vlm-http-client".to_string();
+        }
+    }
+}
+
+fn is_vlm_http_client_backend(backend: &str) -> bool {
+    matches!(backend, "vlm-http-client" | "vllm-http-client")
+}
+
+fn read_string_env(name: &str, default: &str) -> String {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn read_optional_string_env(name: &str) -> Option<String> {
+    env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[derive(Debug, Clone)]

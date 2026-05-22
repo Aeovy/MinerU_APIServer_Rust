@@ -53,13 +53,21 @@ impl ResultBuilder {
             return Ok(response);
         }
 
+        let payload = Self::build_json_payload(task).await?;
+        Ok((status_code, Json(payload)).into_response())
+    }
+
+    /// Build the standard MinerU JSON result payload for a completed task.
+    ///
+    /// Inputs:
+    /// - `task`: completed task metadata and return flags.
+    pub async fn build_json_payload(task: &ParseTask) -> ApiResult<Value> {
         let results = build_result_dict(task).await?;
-        let payload = json!({
+        Ok(json!({
             "backend": task.backend,
             "version": MINERU_VERSION,
             "results": results
-        });
-        Ok((status_code, Json(payload)).into_response())
+        }))
     }
 }
 

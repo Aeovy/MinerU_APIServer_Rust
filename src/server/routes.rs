@@ -67,10 +67,19 @@ pub(crate) async fn file_parse(
             .into_response());
     }
 
+    let status_payload = task_manager.status_payload(&completed, &base_url).await;
+    if !completed.response_format_zip {
+        let mut payload = serde_json::to_value(&status_payload)?;
+        merge_object_fields(
+            &mut payload,
+            ResultBuilder::build_json_payload(&completed).await?,
+        );
+        return Ok((StatusCode::OK, Json(payload)).into_response());
+    }
+
     let mut response =
         ResultBuilder::build_response(&completed, StatusCode::OK, &format!("{task_id}.zip"))
             .await?;
-    let status_payload = task_manager.status_payload(&completed, &base_url).await;
     response.headers_mut().insert(
         FILE_PARSE_TASK_ID_HEADER,
         task_id.to_string().parse().expect("uuid header is valid"),
@@ -246,6 +255,7 @@ async fn parse_multipart(
         apply_form_field(&mut options, &name, &text)?;
     }
     options.return_original_file = options.return_original_file && options.response_format_zip;
+    options.normalize_backend_alias();
     Ok((options, uploads))
 }
 
@@ -337,6 +347,23 @@ fn with_message(payload: impl serde::Serialize, message: &str) -> Value {
     value
 }
 
+/// Merge JSON object fields from `source` into `target`, preserving Python file_parse response shape.
+///
+/// Inputs:
+/// - `target`: task status payload object to be extended.
+/// - `source`: standard result payload object containing backend, version, and results.
+fn merge_object_fields(target: &mut Value, source: Value) {
+    let Some(target_object) = target.as_object_mut() else {
+        return;
+    };
+    let Value::Object(source_object) = source else {
+        return;
+    };
+    for (key, value) in source_object {
+        target_object.insert(key, value);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{apply_form_field, parse_bool};
@@ -357,5 +384,14 @@ mod tests {
         apply_form_field(&mut options, "return_images", "true").unwrap();
         assert_eq!(options.backend, "vlm-http-client");
         assert!(options.return_images);
+    }
+
+    #[test]
+    fn normalizes_vllm_http_client_alias() {
+        let mut options = ParseOptions::default();
+        apply_form_field(&mut options, "backend", "vllm-http-client").unwrap();
+        options.normalize_backend_alias();
+        assert_eq!(options.backend, "vlm-http-client");
+        assert!(options.validate().is_ok());
     }
 }

@@ -42,9 +42,14 @@ impl ServiceConfig {
     /// Inputs:
     /// - `args`: command-line options provided by the user.
     pub fn from_args(args: &CliArgs) -> Self {
+        let default_max_concurrent_requests = if cfg!(target_os = "macos") {
+            1
+        } else {
+            DEFAULT_MAX_CONCURRENT_REQUESTS
+        };
         let max_concurrent_requests = read_usize_env(
             "MINERU_API_MAX_CONCURRENT_REQUESTS",
-            DEFAULT_MAX_CONCURRENT_REQUESTS,
+            default_max_concurrent_requests,
             1,
         );
         let processing_window_size = read_usize_env(
