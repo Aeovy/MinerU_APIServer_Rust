@@ -36,6 +36,7 @@ impl AppState {
         let parser = Arc::new(VlmDocumentParser::new(
             client,
             config.processing_window_size,
+            config.vlm_max_concurrency,
         ));
         let request_semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         let state = Self {

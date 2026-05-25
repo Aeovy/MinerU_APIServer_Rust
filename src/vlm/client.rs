@@ -1,10 +1,11 @@
-use std::{env, sync::OnceLock, time::Duration};
+use std::{collections::HashMap, env, sync::OnceLock, time::Duration};
 
 use async_openai::{config::Config, Client};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
 use crate::error::{ApiError, ApiResult};
 
@@ -93,10 +94,10 @@ pub struct VlmRequest {
     pub priority: Option<i32>,
 }
 
-#[derive(Clone)]
 pub struct VlmHttpClient {
     http_client: reqwest::Client,
     api_key: Option<String>,
+    model_name_cache: Mutex<HashMap<String, String>>,
 }
 
 impl VlmHttpClient {
@@ -113,6 +114,7 @@ impl VlmHttpClient {
         Self {
             http_client,
             api_key,
+            model_name_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -122,7 +124,7 @@ impl VlmHttpClient {
     /// - `request`: prompt, optional image, sampling params, and server URL.
     pub async fn predict(&self, request: VlmRequest) -> ApiResult<String> {
         let base_url = resolve_server_url(request.server_url.as_deref())?;
-        let model_name = self.resolve_model_name(&base_url).await?;
+        let model_name = self.resolve_model_name_cached(&base_url).await?;
         let body = build_chat_body(&model_name, &request);
         let data: Value = self
             .openai_client(&base_url)
@@ -130,6 +132,23 @@ impl VlmHttpClient {
             .create_byot(body)
             .await?;
         parse_chat_content(&data)
+    }
+
+    /// Resolve and cache the model name for one OpenAI-compatible VLM server.
+    ///
+    /// Inputs:
+    /// - `base_url`: normalized server origin without `/v1`.
+    async fn resolve_model_name_cached(&self, base_url: &str) -> ApiResult<String> {
+        let mut cache = self.model_name_cache.lock().await;
+        if let Some(model_name) = cache.get(base_url).cloned() {
+            return Ok(model_name);
+        }
+
+        let model_name = self.resolve_model_name(base_url).await?;
+        Ok(cache
+            .entry(base_url.to_string())
+            .or_insert(model_name)
+            .clone())
     }
 
     async fn resolve_model_name(&self, base_url: &str) -> ApiResult<String> {
@@ -376,9 +395,48 @@ fn model_list_from_payload(base_url: &str, payload: &Value) -> ApiResult<Vec<Str
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use std::{
+        env,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
 
-    use super::parse_chat_content;
+    use axum::{routing::get, Json, Router};
+    use futures::future::join_all;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    use super::{parse_chat_content, VlmHttpClient};
+
+    async fn spawn_models_server(
+        counter: Arc<AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new().route(
+            "/v1/models",
+            get({
+                let counter = counter.clone();
+                move || {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "data": [{ "id": "cached-model" }] }))
+                    }
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server must bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("test server must run");
+        });
+        (base_url, server)
+    }
 
     #[test]
     fn parses_stop_content() {
@@ -392,5 +450,25 @@ mod tests {
     fn rejects_empty_choices() {
         let payload = json!({ "choices": [] });
         assert!(parse_chat_content(&payload).is_err());
+    }
+
+    #[tokio::test]
+    async fn caches_resolved_model_name_across_concurrent_requests() {
+        let previous_model_name = env::var("MINERU_VL_MODEL_NAME").ok();
+        env::remove_var("MINERU_VL_MODEL_NAME");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = spawn_models_server(counter.clone()).await;
+        let client = VlmHttpClient::new();
+
+        let results = join_all((0..16).map(|_| client.resolve_model_name_cached(&base_url))).await;
+
+        server.abort();
+        if let Some(value) = previous_model_name {
+            env::set_var("MINERU_VL_MODEL_NAME", value);
+        }
+        for result in results {
+            assert_eq!(result.unwrap(), "cached-model");
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 }

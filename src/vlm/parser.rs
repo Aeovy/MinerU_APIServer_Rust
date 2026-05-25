@@ -2,13 +2,14 @@ use std::{
     collections::HashSet,
     io::Cursor,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
+use futures::{stream, StreamExt};
 use image::{imageops, DynamicImage, GenericImageView, ImageFormat, Rgba};
 use pdfium_render::prelude::*;
 use serde_json::{json, Value};
-use tokio::fs;
+use tokio::{fs, sync::Semaphore};
 
 use crate::{
     domain::models::{ContentBlock, ParseTask, ParsedDocument, StoredUpload},
@@ -27,15 +28,42 @@ const MAX_IMAGE_EDGE_RATIO: f32 = 50.0;
 
 #[derive(Clone)]
 pub struct VlmDocumentParser {
-    client: std::sync::Arc<VlmHttpClient>,
+    client: Arc<VlmHttpClient>,
     processing_window_size: usize,
+    vlm_max_concurrency: usize,
+}
+
+struct PageParseResult {
+    page_index: usize,
+    page_width: u32,
+    page_height: u32,
+    blocks: Vec<ContentBlock>,
+    image_files: Vec<PathBuf>,
+}
+
+struct BlockExtractJob {
+    block_index: usize,
+    block_type: String,
+    image_png: Vec<u8>,
+    store_image: bool,
+}
+
+struct BlockExtractResult {
+    block_index: usize,
+    content: String,
+    image_png: Option<Vec<u8>>,
 }
 
 impl VlmDocumentParser {
-    pub fn new(client: std::sync::Arc<VlmHttpClient>, processing_window_size: usize) -> Self {
+    pub fn new(
+        client: Arc<VlmHttpClient>,
+        processing_window_size: usize,
+        vlm_max_concurrency: usize,
+    ) -> Self {
         Self {
             client,
             processing_window_size,
+            vlm_max_concurrency: vlm_max_concurrency.max(1),
         }
     }
 
@@ -71,33 +99,49 @@ impl VlmDocumentParser {
         let pages = self
             .load_pages(upload, task.start_page_id, task.end_page_id)
             .await?;
+        let limiter = Arc::new(Semaphore::new(self.vlm_max_concurrency));
+        let mut page_results = Vec::new();
+        let mut enumerated_pages = pages.into_iter().enumerate();
+
+        loop {
+            let page_window = enumerated_pages
+                .by_ref()
+                .take(self.processing_window_size.max(1))
+                .collect::<Vec<_>>();
+            if page_window.is_empty() {
+                break;
+            }
+
+            let unordered_results =
+                stream::iter(page_window.into_iter().map(|(page_index, page)| {
+                    self.parse_page(task, page_index, page, limiter.clone())
+                }))
+                .buffer_unordered(self.vlm_max_concurrency)
+                .collect::<Vec<_>>()
+                .await;
+            let mut window_results = unordered_results
+                .into_iter()
+                .collect::<ApiResult<Vec<PageParseResult>>>()?;
+            window_results.sort_by_key(|result| result.page_index);
+            page_results.extend(window_results);
+        }
+        page_results.sort_by_key(|result| result.page_index);
+
         let mut all_page_blocks = Vec::new();
         let mut markdown_parts = Vec::new();
         let mut content_list = Vec::new();
         let mut image_files = Vec::new();
 
-        for (page_index, page_image) in pages.into_iter().enumerate() {
-            let priority = Some(page_index as i32);
-            let layout_image = encode_png(&prepare_layout_image(&page_image)?)?;
-            let layout_output = self
-                .client
-                .predict(VlmRequest {
-                    server_url: task.server_url.clone(),
-                    prompt: layout_prompt().to_string(),
-                    image_png: Some(layout_image),
-                    sampling_params: layout_sampling_params(),
-                    priority,
-                })
-                .await?;
-            let mut blocks = parse_layout_output(&layout_output);
-            self.extract_blocks(task, page_index, &page_image, &mut blocks, &mut image_files)
-                .await?;
+        for result in page_results {
+            let page_index = result.page_index;
+            let blocks = result.blocks;
             markdown_parts.push(blocks_to_markdown(&blocks));
             content_list.extend(blocks_to_content_list(page_index, &blocks));
+            image_files.extend(result.image_files);
             all_page_blocks.push(json!({
                 "preproc_blocks": blocks,
                 "discarded_blocks": [],
-                "page_size": [page_image.width(), page_image.height()],
+                "page_size": [result.page_width, result.page_height],
                 "page_idx": page_index
             }));
         }
@@ -121,16 +165,67 @@ impl VlmDocumentParser {
         })
     }
 
+    /// Parse one rendered page with MinerU's two-step VLM flow.
+    ///
+    /// Inputs:
+    /// - `task`: request options and output directory.
+    /// - `page_index`: zero-based page index in the parsed document.
+    /// - `page_image`: rendered PDF page or uploaded image.
+    /// - `limiter`: shared per-document VLM request limiter.
+    async fn parse_page(
+        &self,
+        task: &ParseTask,
+        page_index: usize,
+        page_image: DynamicImage,
+        limiter: Arc<Semaphore>,
+    ) -> ApiResult<PageParseResult> {
+        let priority = Some(page_index as i32);
+        let layout_image = encode_png(&prepare_layout_image(&page_image)?)?;
+        let layout_output = self
+            .predict_with_limit(
+                &limiter,
+                VlmRequest {
+                    server_url: task.server_url.clone(),
+                    prompt: layout_prompt().to_string(),
+                    image_png: Some(layout_image),
+                    sampling_params: layout_sampling_params(),
+                    priority,
+                },
+            )
+            .await?;
+        let mut blocks = parse_layout_output(&layout_output);
+        let image_files = self
+            .extract_blocks(task, page_index, &page_image, &mut blocks, limiter)
+            .await?;
+
+        Ok(PageParseResult {
+            page_index,
+            page_width: page_image.width(),
+            page_height: page_image.height(),
+            blocks,
+            image_files,
+        })
+    }
+
+    /// Extract content for all eligible blocks on one page concurrently.
+    ///
+    /// Inputs:
+    /// - `task`: request options and output directory.
+    /// - `page_index`: zero-based page index.
+    /// - `page_image`: source page image used for block crops.
+    /// - `blocks`: layout blocks to update with recognized content.
+    /// - `limiter`: shared per-document VLM request limiter.
     async fn extract_blocks(
         &self,
         task: &ParseTask,
         page_index: usize,
         page_image: &DynamicImage,
         blocks: &mut [ContentBlock],
-        image_files: &mut Vec<PathBuf>,
-    ) -> ApiResult<()> {
+        limiter: Arc<Semaphore>,
+    ) -> ApiResult<Vec<PathBuf>> {
         let skip_types = skip_extract_types(task.image_analysis);
-        for (block_index, block) in blocks.iter_mut().enumerate() {
+        let mut jobs = Vec::new();
+        for (block_index, block) in blocks.iter().enumerate() {
             if skip_types.contains(block.block_type.as_str()) {
                 continue;
             }
@@ -140,40 +235,106 @@ impl VlmDocumentParser {
             }
             let block_image = resize_by_need(block_image);
             let image_png = encode_png(&block_image)?;
-            let content = self
-                .client
-                .predict(VlmRequest {
-                    server_url: task.server_url.clone(),
-                    prompt: prompt_for_block(&block.block_type).to_string(),
-                    image_png: Some(image_png),
-                    sampling_params: sampling_params_for_block(&block.block_type),
-                    priority: Some(block_index as i32),
-                })
-                .await?;
-            if !content.is_empty() {
-                block.content = Some(content);
+            jobs.push(BlockExtractJob {
+                block_index,
+                block_type: block.block_type.clone(),
+                image_png,
+                store_image: matches!(block.block_type.as_str(), "image" | "chart" | "table"),
+            });
+        }
+
+        let unordered_results =
+            stream::iter(jobs.into_iter().map(|job| {
+                self.extract_block(task, page_priority(page_index), job, limiter.clone())
+            }))
+            .buffer_unordered(self.vlm_max_concurrency)
+            .collect::<Vec<_>>()
+            .await;
+        let mut results = unordered_results
+            .into_iter()
+            .collect::<ApiResult<Vec<BlockExtractResult>>>()?;
+        results.sort_by_key(|result| result.block_index);
+
+        let mut image_files = Vec::new();
+        for result in results {
+            if !result.content.is_empty() {
+                blocks[result.block_index].content = Some(result.content);
             }
-            if matches!(block.block_type.as_str(), "image" | "chart" | "table") {
+            if let Some(image_png) = result.image_png {
                 let image_path = self
-                    .write_result_image(task, page_index, block_index, &block_image)
+                    .write_result_image_bytes(task, page_index, result.block_index, &image_png)
                     .await?;
                 image_files.push(image_path);
             }
         }
-        Ok(())
+        Ok(image_files)
     }
 
-    async fn write_result_image(
+    /// Send one block crop to the VLM backend and preserve optional image bytes.
+    ///
+    /// Inputs:
+    /// - `task`: request options copied from the multipart form.
+    /// - `priority`: backend scheduling priority.
+    /// - `job`: prepared block image, prompt type, and output-image flag.
+    /// - `limiter`: shared per-document VLM request limiter.
+    async fn extract_block(
+        &self,
+        task: &ParseTask,
+        priority: Option<i32>,
+        job: BlockExtractJob,
+        limiter: Arc<Semaphore>,
+    ) -> ApiResult<BlockExtractResult> {
+        let image_png = job.image_png;
+        let result_image_png = job.store_image.then(|| image_png.clone());
+        let content = self
+            .predict_with_limit(
+                &limiter,
+                VlmRequest {
+                    server_url: task.server_url.clone(),
+                    prompt: prompt_for_block(&job.block_type).to_string(),
+                    image_png: Some(image_png),
+                    sampling_params: sampling_params_for_block(&job.block_type),
+                    priority,
+                },
+            )
+            .await?;
+
+        Ok(BlockExtractResult {
+            block_index: job.block_index,
+            content,
+            image_png: result_image_png,
+        })
+    }
+
+    /// Execute one VLM request under the per-document concurrency limit.
+    ///
+    /// Inputs:
+    /// - `limiter`: semaphore shared by all page and block requests in this document.
+    /// - `request`: OpenAI-compatible chat completion payload data.
+    async fn predict_with_limit(
+        &self,
+        limiter: &Arc<Semaphore>,
+        request: VlmRequest,
+    ) -> ApiResult<String> {
+        let _permit = limiter
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        self.client.predict(request).await
+    }
+
+    async fn write_result_image_bytes(
         &self,
         task: &ParseTask,
         page_index: usize,
         block_index: usize,
-        image: &DynamicImage,
+        image_png: &[u8],
     ) -> ApiResult<PathBuf> {
         let image_dir = task.output_dir.join("_pending_images");
         fs::create_dir_all(&image_dir).await?;
         let path = image_dir.join(format!("page_{page_index}_block_{block_index}.png"));
-        fs::write(&path, encode_png(image)?).await?;
+        fs::write(&path, image_png).await?;
         Ok(path)
     }
 
@@ -443,6 +604,10 @@ fn parse_angle(token: &str) -> Option<u16> {
         "<|rotate_left|>" => Some(270),
         _ => None,
     }
+}
+
+fn page_priority(page_index: usize) -> Option<i32> {
+    Some(i32::try_from(page_index).unwrap_or(i32::MAX))
 }
 
 fn allowed_block_types() -> &'static HashSet<&'static str> {

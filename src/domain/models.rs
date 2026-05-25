@@ -233,6 +233,7 @@ pub struct HealthPayload {
     pub failed_tasks: usize,
     pub max_concurrent_requests: usize,
     pub processing_window_size: usize,
+    pub vlm_max_concurrency: usize,
     pub task_retention_seconds: u64,
     pub task_cleanup_interval_seconds: u64,
 }

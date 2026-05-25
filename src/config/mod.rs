@@ -6,6 +6,7 @@ pub const API_PROTOCOL_VERSION: u8 = 1;
 pub const MINERU_VERSION: &str = "3.1.15";
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 3;
 pub const DEFAULT_PROCESSING_WINDOW_SIZE: usize = 64;
+pub const DEFAULT_VLM_MAX_CONCURRENCY: usize = 100;
 pub const DEFAULT_TASK_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS: u64 = 5 * 60;
 pub const DEFAULT_OUTPUT_ROOT: &str = "./output";
@@ -32,6 +33,7 @@ pub struct ServiceConfig {
     pub output_root: PathBuf,
     pub max_concurrent_requests: usize,
     pub processing_window_size: usize,
+    pub vlm_max_concurrency: usize,
     pub task_retention: Duration,
     pub task_cleanup_interval: Duration,
 }
@@ -57,6 +59,8 @@ impl ServiceConfig {
             DEFAULT_PROCESSING_WINDOW_SIZE,
             1,
         );
+        let vlm_max_concurrency =
+            read_usize_env("MINERU_VLM_MAX_CONCURRENCY", DEFAULT_VLM_MAX_CONCURRENCY, 1);
         let task_retention = Duration::from_secs(read_u64_env(
             "MINERU_API_TASK_RETENTION_SECONDS",
             DEFAULT_TASK_RETENTION_SECONDS,
@@ -77,6 +81,7 @@ impl ServiceConfig {
             output_root,
             max_concurrent_requests,
             processing_window_size,
+            vlm_max_concurrency,
             task_retention,
             task_cleanup_interval,
         }
@@ -114,7 +119,9 @@ fn read_u64_env(name: &str, default: u64, minimum: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::is_public_bind_host;
+    use std::env;
+
+    use super::{is_public_bind_host, CliArgs, DEFAULT_VLM_MAX_CONCURRENCY};
 
     #[test]
     fn detects_public_bind_hosts() {
@@ -122,5 +129,39 @@ mod tests {
         assert!(is_public_bind_host("::"));
         assert!(!is_public_bind_host("127.0.0.1"));
         assert!(!is_public_bind_host("localhost"));
+    }
+
+    #[test]
+    fn reads_vlm_max_concurrency_with_default_and_minimum() {
+        let previous = env::var("MINERU_VLM_MAX_CONCURRENCY").ok();
+        let args = CliArgs {
+            host: "127.0.0.1".to_string(),
+            port: 34000,
+            allow_public_http_client: false,
+        };
+
+        env::remove_var("MINERU_VLM_MAX_CONCURRENCY");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).vlm_max_concurrency,
+            DEFAULT_VLM_MAX_CONCURRENCY
+        );
+
+        env::set_var("MINERU_VLM_MAX_CONCURRENCY", "0");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).vlm_max_concurrency,
+            DEFAULT_VLM_MAX_CONCURRENCY
+        );
+
+        env::set_var("MINERU_VLM_MAX_CONCURRENCY", "7");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).vlm_max_concurrency,
+            7
+        );
+
+        if let Some(value) = previous {
+            env::set_var("MINERU_VLM_MAX_CONCURRENCY", value);
+        } else {
+            env::remove_var("MINERU_VLM_MAX_CONCURRENCY");
+        }
     }
 }

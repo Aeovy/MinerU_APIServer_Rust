@@ -207,6 +207,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> ApiResult<Json<Heal
         failed_tasks: stats.failed,
         max_concurrent_requests: state.config().max_concurrent_requests,
         processing_window_size: state.config().processing_window_size,
+        vlm_max_concurrency: state.config().vlm_max_concurrency,
         task_retention_seconds: state.config().task_retention.as_secs(),
         task_cleanup_interval_seconds: state.config().task_cleanup_interval.as_secs(),
     }))
