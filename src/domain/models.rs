@@ -257,5 +257,6 @@ pub struct ParsedDocument {
     pub middle_json: Value,
     pub model_output: Value,
     pub content_list: Value,
+    pub content_list_v2: Value,
     pub image_files: Vec<PathBuf>,
 }
