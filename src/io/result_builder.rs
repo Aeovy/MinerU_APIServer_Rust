@@ -10,6 +10,8 @@ use axum::{
     Json,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
+use image::ImageFormat;
+use printpdf::{Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, RawImage, XObjectTransform};
 use serde_json::{json, Map, Value};
 use tokio::fs;
 use zip::{write::SimpleFileOptions, CompressionMethod, ZipWriter};
@@ -181,9 +183,16 @@ async fn build_zip(task: &ParseTask) -> ApiResult<Vec<u8>> {
                     task.uploads.get(file_index),
                     task.upload_suffixes.get(file_index),
                 ) {
-                    let expected_name = format!("{file_name}_origin.{suffix}");
+                    let source_bytes = std::fs::read(upload_path).map_err(ApiError::from)?;
+                    let (expected_name, bytes) = if suffix == "pdf" {
+                        (format!("{file_name}_origin.pdf"), source_bytes)
+                    } else {
+                        (
+                            format!("{file_name}_origin.pdf"),
+                            image_to_pdf_bytes(&source_bytes)?,
+                        )
+                    };
                     let arcname = format!("{file_name}/vlm/{expected_name}");
-                    let bytes = std::fs::read(upload_path).map_err(ApiError::from)?;
                     writer
                         .start_file(arcname, options)
                         .map_err(|error| ApiError::Internal(error.to_string()))?;
@@ -234,6 +243,45 @@ fn add_file(
     Ok(())
 }
 
+/// Convert one uploaded image into the PDF original file shape used by Python MinerU.
+///
+/// Inputs:
+/// - `image_bytes`: original uploaded image bytes.
+fn image_to_pdf_bytes(image_bytes: &[u8]) -> ApiResult<Vec<u8>> {
+    const IMAGE_PDF_DPI: f32 = 200.0;
+    let image = image::load_from_memory(image_bytes)
+        .map_err(|error| ApiError::BadRequest(format!("Failed to load image: {error}")))?;
+    let rgb_image = image.to_rgb8();
+    let width = rgb_image.width();
+    let height = rgb_image.height();
+    let mut png_bytes = Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(rgb_image)
+        .write_to(&mut png_bytes, ImageFormat::Png)
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+
+    let mut warnings = Vec::new();
+    let raw_image = RawImage::decode_from_bytes(&png_bytes.into_inner(), &mut warnings)
+        .map_err(ApiError::Internal)?;
+    let mut doc = PdfDocument::new("MinerU original image");
+    let image_id = doc.add_image(&raw_image);
+    let page_width_mm = width as f32 * 25.4 / IMAGE_PDF_DPI;
+    let page_height_mm = height as f32 * 25.4 / IMAGE_PDF_DPI;
+    let page = PdfPage::new(
+        Mm(page_width_mm),
+        Mm(page_height_mm),
+        vec![Op::UseXobject {
+            id: image_id,
+            transform: XObjectTransform {
+                dpi: Some(IMAGE_PDF_DPI),
+                ..Default::default()
+            },
+        }],
+    );
+    Ok(doc
+        .with_pages(vec![page])
+        .save(&PdfSaveOptions::default(), &mut warnings))
+}
+
 async fn read_text(path: PathBuf) -> ApiResult<Value> {
     if !path.exists() {
         return Ok(Value::Null);
@@ -267,4 +315,64 @@ async fn read_images(images_dir: &Path) -> ApiResult<Value> {
         );
     }
     Ok(Value::Object(images))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Cursor, Read};
+
+    use chrono::Utc;
+    use image::{ImageBuffer, ImageFormat, Rgb};
+    use tempfile::tempdir;
+    use uuid::Uuid;
+    use zip::ZipArchive;
+
+    use crate::domain::models::{ParseTask, TaskStatus};
+
+    use super::build_zip;
+
+    #[tokio::test]
+    async fn image_original_is_zipped_as_pdf() {
+        let temp = tempdir().expect("temp dir");
+        let upload_path = temp.path().join("sample.png");
+        let image = ImageBuffer::from_pixel(4, 3, Rgb([255_u8, 0, 0]));
+        image
+            .save_with_format(&upload_path, ImageFormat::Png)
+            .expect("png fixture");
+        let task = ParseTask {
+            task_id: Uuid::new_v4(),
+            status: TaskStatus::Completed,
+            backend: "vlm-http-client".to_string(),
+            file_names: vec!["sample".to_string()],
+            created_at: Utc::now(),
+            output_dir: temp.path().to_path_buf(),
+            image_analysis: true,
+            server_url: None,
+            return_md: false,
+            return_middle_json: false,
+            return_model_output: false,
+            return_content_list: false,
+            return_images: false,
+            response_format_zip: true,
+            return_original_file: true,
+            start_page_id: 0,
+            end_page_id: 99999,
+            uploads: vec![upload_path],
+            upload_suffixes: vec!["png".to_string()],
+            submit_order: 0,
+            started_at: None,
+            completed_at: Some(Utc::now()),
+            error: None,
+        };
+
+        let bytes = build_zip(&task).await.expect("zip bytes");
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("zip archive");
+        assert!(archive.by_name("sample/vlm/sample_origin.png").is_err());
+        let mut original = archive
+            .by_name("sample/vlm/sample_origin.pdf")
+            .expect("python-compatible image original path");
+        let mut original_bytes = Vec::new();
+        original.read_to_end(&mut original_bytes).expect("read pdf");
+        assert!(original_bytes.starts_with(b"%PDF"));
+    }
 }
