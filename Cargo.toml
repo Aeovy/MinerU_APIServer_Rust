@@ -13,6 +13,7 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
+md-5 = "0.10"
 mime_guess = "2.0"
 pdfium-render = "0.8"
 pdfium-auto = { version = "0.3.0", features = ["bundled"] }
@@ -22,6 +23,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "mul
 secrecy = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1.45", features = ["full"] }
 tower-http = { version = "0.6", features = ["compression-gzip", "cors", "trace"] }

@@ -8,7 +8,6 @@ use std::{
 use futures::{stream, StreamExt};
 use image::{imageops, DynamicImage, GenericImageView, ImageFormat, Rgba};
 use pdfium_render::prelude::*;
-use serde_json::{json, Value};
 use tokio::{fs, sync::Semaphore};
 
 use crate::{
@@ -20,6 +19,7 @@ use super::client::{
     layout_prompt, layout_sampling_params, prompt_for_block, sampling_params_for_block,
     VlmHttpClient, VlmRequest,
 };
+use super::python_compat::{build_document_output, PythonPageInput};
 
 const DEFAULT_PDF_IMAGE_DPI: f32 = 200.0;
 const LAYOUT_IMAGE_SIZE: u32 = 1036;
@@ -37,8 +37,16 @@ struct PageParseResult {
     page_index: usize,
     page_width: u32,
     page_height: u32,
+    point_width: u32,
+    point_height: u32,
+    page_image: DynamicImage,
     blocks: Vec<ContentBlock>,
-    image_files: Vec<PathBuf>,
+}
+
+struct RenderedPage {
+    image: DynamicImage,
+    point_width: u32,
+    point_height: u32,
 }
 
 struct BlockExtractJob {
@@ -126,51 +134,29 @@ impl VlmDocumentParser {
             page_results.extend(window_results);
         }
         page_results.sort_by_key(|result| result.page_index);
-
-        let mut all_page_blocks = Vec::new();
-        let mut markdown_parts = Vec::new();
-        let mut content_list = Vec::new();
-        let mut content_list_v2_pages = Vec::new();
-        let mut image_files = Vec::new();
-
-        for result in page_results {
-            let page_index = result.page_index;
-            let blocks = result.blocks;
-            let PageContent {
-                content_list: page_content_list,
-                content_list_v2: page_content_list_v2,
-                middle_para_blocks,
-            } = build_page_content(page_index, &blocks);
-            markdown_parts.push(blocks_to_markdown(&blocks));
-            content_list.extend(page_content_list);
-            content_list_v2_pages.push(Value::Array(page_content_list_v2));
-            image_files.extend(result.image_files);
-            all_page_blocks.push(json!({
-                "preproc_blocks": blocks,
-                "discarded_blocks": [],
-                "para_blocks": middle_para_blocks,
-                "page_size": [result.page_width, result.page_height],
-                "page_idx": page_index
-            }));
-        }
+        let python_pages = page_results
+            .into_iter()
+            .map(|result| PythonPageInput {
+                page_index: result.page_index,
+                page_width: result.page_width,
+                page_height: result.page_height,
+                point_width: result.point_width,
+                point_height: result.point_height,
+                image: result.page_image,
+                blocks: result.blocks,
+            })
+            .collect::<Vec<_>>();
+        let output =
+            build_document_output(&python_pages, &task.output_dir.join("_pending_images")).await?;
 
         Ok(ParsedDocument {
             file_name: upload.stem.clone(),
-            markdown: markdown_parts.join("\n\n"),
-            middle_json: json!({
-                "pdf_info": all_page_blocks,
-                "_backend": "vlm",
-                "_version_name": crate::config::MINERU_VERSION
-            }),
-            model_output: json!({
-                "pages": all_page_blocks
-                    .iter()
-                    .map(|page| page.get("preproc_blocks").cloned().unwrap_or_else(|| json!([])))
-                    .collect::<Vec<Value>>()
-            }),
-            content_list: Value::Array(content_list),
-            content_list_v2: Value::Array(content_list_v2_pages),
-            image_files,
+            markdown: output.markdown,
+            middle_json: output.middle_json,
+            model_output: output.model_output,
+            content_list: output.content_list,
+            content_list_v2: output.content_list_v2,
+            image_files: output.image_files,
         })
     }
 
@@ -185,9 +171,10 @@ impl VlmDocumentParser {
         &self,
         task: &ParseTask,
         page_index: usize,
-        page_image: DynamicImage,
+        page: RenderedPage,
         limiter: Arc<Semaphore>,
     ) -> ApiResult<PageParseResult> {
+        let page_image = page.image;
         let priority = Some(page_index as i32);
         let layout_image = encode_png(&prepare_layout_image(&page_image)?)?;
         let layout_output = self
@@ -203,16 +190,17 @@ impl VlmDocumentParser {
             )
             .await?;
         let mut blocks = parse_layout_output(&layout_output);
-        let image_files = self
-            .extract_blocks(task, page_index, &page_image, &mut blocks, limiter)
+        self.extract_blocks(task, page_index, &page_image, &mut blocks, limiter)
             .await?;
 
         Ok(PageParseResult {
             page_index,
             page_width: page_image.width(),
             page_height: page_image.height(),
+            point_width: page.point_width,
+            point_height: page.point_height,
+            page_image,
             blocks,
-            image_files,
         })
     }
 
@@ -231,7 +219,7 @@ impl VlmDocumentParser {
         page_image: &DynamicImage,
         blocks: &mut [ContentBlock],
         limiter: Arc<Semaphore>,
-    ) -> ApiResult<Vec<PathBuf>> {
+    ) -> ApiResult<()> {
         let skip_types = skip_extract_types(task.image_analysis);
         let mut jobs = Vec::new();
         for (block_index, block) in blocks.iter().enumerate() {
@@ -248,7 +236,7 @@ impl VlmDocumentParser {
                 block_index,
                 block_type: block.block_type.clone(),
                 image_png,
-                store_image: matches!(block.block_type.as_str(), "image" | "chart" | "table"),
+                store_image: false,
             });
         }
 
@@ -264,19 +252,16 @@ impl VlmDocumentParser {
             .collect::<ApiResult<Vec<BlockExtractResult>>>()?;
         results.sort_by_key(|result| result.block_index);
 
-        let mut image_files = Vec::new();
         for result in results {
             if !result.content.is_empty() {
                 blocks[result.block_index].content = Some(result.content);
             }
             if let Some(image_png) = result.image_png {
-                let image_path = self
-                    .write_result_image_bytes(task, page_index, result.block_index, &image_png)
+                self.write_result_image_bytes(task, page_index, result.block_index, &image_png)
                     .await?;
-                image_files.push(image_path);
             }
         }
-        Ok(image_files)
+        Ok(())
     }
 
     /// Send one block crop to the VLM backend and preserve optional image bytes.
@@ -390,7 +375,7 @@ impl VlmDocumentParser {
         upload: &StoredUpload,
         start_page_id: usize,
         end_page_id: usize,
-    ) -> ApiResult<Vec<DynamicImage>> {
+    ) -> ApiResult<Vec<RenderedPage>> {
         let bytes = fs::read(&upload.path).await?;
         if upload.suffix == "pdf" {
             let window_size = self.processing_window_size.max(1);
@@ -402,7 +387,11 @@ impl VlmDocumentParser {
         } else {
             let image = image::load_from_memory(&bytes)
                 .map_err(|error| ApiError::BadRequest(format!("Failed to load image: {error}")))?;
-            Ok(vec![image])
+            Ok(vec![RenderedPage {
+                point_width: image.width(),
+                point_height: image.height(),
+                image,
+            }])
         }
     }
 }
@@ -471,7 +460,7 @@ fn render_pdf_pages(
     start_page_id: usize,
     end_page_id: usize,
     processing_window_size: usize,
-) -> ApiResult<Vec<DynamicImage>> {
+) -> ApiResult<Vec<RenderedPage>> {
     let pdfium = bind_pdfium()?;
     let document = pdfium
         .load_pdf_from_byte_slice(bytes, None)
@@ -490,6 +479,8 @@ fn render_pdf_pages(
                 .pages()
                 .get(page_index as u16)
                 .map_err(|error| ApiError::Internal(error.to_string()))?;
+            let point_width = page.width().value.round().max(1.0) as u32;
+            let point_height = page.height().value.round().max(1.0) as u32;
             let width = ((page.width().value / 72.0) * DEFAULT_PDF_IMAGE_DPI).round() as i32;
             let height = ((page.height().value / 72.0) * DEFAULT_PDF_IMAGE_DPI).round() as i32;
             let image = page
@@ -500,7 +491,11 @@ fn render_pdf_pages(
                 )
                 .map_err(|error| ApiError::Internal(error.to_string()))?
                 .as_image();
-            images.push(image);
+            images.push(RenderedPage {
+                image,
+                point_width,
+                point_height,
+            });
         }
     }
     Ok(images)
@@ -663,548 +658,9 @@ fn skip_extract_types(image_analysis: bool) -> HashSet<&'static str> {
     types
 }
 
-fn blocks_to_markdown(blocks: &[ContentBlock]) -> String {
-    blocks
-        .iter()
-        .filter_map(|block| block.content.as_deref())
-        .filter(|content| !content.trim().is_empty())
-        .collect::<Vec<&str>>()
-        .join("\n\n")
-}
-
-#[derive(Debug, Clone)]
-struct PageContent {
-    content_list: Vec<Value>,
-    content_list_v2: Vec<Value>,
-    middle_para_blocks: Vec<Value>,
-}
-
-#[derive(Debug, Clone)]
-struct ParaBlock {
-    para_type: String,
-    bbox: [f32; 4],
-    index: usize,
-    content: String,
-    sub_type: Option<String>,
-    children: Vec<ParaChild>,
-}
-
-#[derive(Debug, Clone)]
-struct ParaChild {
-    child_type: String,
-    bbox: [f32; 4],
-    index: usize,
-    content: String,
-}
-
-/// Build MinerU Python-compatible content_list outputs from raw VLM layout blocks.
-///
-/// Inputs:
-/// - `page_index`: zero-based page index.
-/// - `blocks`: raw layout blocks after optional content extraction.
-fn build_page_content(page_index: usize, blocks: &[ContentBlock]) -> PageContent {
-    let para_blocks = build_para_blocks(blocks);
-    PageContent {
-        content_list: para_blocks
-            .iter()
-            .filter_map(|para| para_to_content_list_v1(page_index, para))
-            .collect(),
-        content_list_v2: para_blocks
-            .iter()
-            .filter_map(|para| para_to_content_list_v2(page_index, para))
-            .collect(),
-        middle_para_blocks: para_blocks.iter().map(para_to_middle_json).collect(),
-    }
-}
-
-/// Convert flat raw layout blocks into a small Python MagicModel-like paragraph layer.
-///
-/// Inputs:
-/// - `blocks`: page blocks in original layout order.
-fn build_para_blocks(blocks: &[ContentBlock]) -> Vec<ParaBlock> {
-    let child_parent_map = build_visual_child_parent_map(blocks);
-    let mut para_blocks = Vec::new();
-
-    for (index, block) in blocks.iter().enumerate() {
-        if is_visual_child_type(&block.block_type) && child_parent_map[index].is_some() {
-            continue;
-        }
-
-        let Some(mut para) = para_from_block(index, block) else {
-            continue;
-        };
-
-        if is_visual_main_type(&para.para_type) {
-            para.children = blocks
-                .iter()
-                .enumerate()
-                .filter_map(|(child_index, child)| {
-                    (child_parent_map[child_index] == Some(index))
-                        .then(|| child_from_block(child_index, child, &para.para_type))
-                        .flatten()
-                })
-                .collect();
-        }
-
-        para_blocks.push(para);
-    }
-
-    para_blocks.sort_by_key(|para| para.index);
-    para_blocks
-}
-
-fn para_from_block(index: usize, block: &ContentBlock) -> Option<ParaBlock> {
-    let content = block.content.clone().unwrap_or_default();
-    let para_type = match block.block_type.as_str() {
-        "equation" => "interline_equation",
-        "algorithm" => "code",
-        "list_item" => "text",
-        "image_block" => "image",
-        "image_caption" | "table_caption" | "code_caption" | "image_footnote"
-        | "table_footnote" => "text",
-        raw_type => raw_type,
-    };
-    let sub_type = match block.block_type.as_str() {
-        "code" | "algorithm" => Some(block.block_type.clone()),
-        "list" => Some("text".to_string()),
-        _ => None,
-    };
-
-    if !is_visual_main_type(para_type) && content.trim().is_empty() {
-        return None;
-    }
-
-    Some(ParaBlock {
-        para_type: para_type.to_string(),
-        bbox: block.bbox,
-        index,
-        content,
-        sub_type,
-        children: Vec::new(),
-    })
-}
-
-fn child_from_block(index: usize, block: &ContentBlock, parent_type: &str) -> Option<ParaChild> {
-    let content = block.content.clone().unwrap_or_default();
-    if content.trim().is_empty() {
-        return None;
-    }
-    let child_type = match (parent_type, block.block_type.as_str()) {
-        ("image", "image_footnote" | "table_footnote") => "image_footnote",
-        ("table", "image_footnote" | "table_footnote") => "table_footnote",
-        ("chart", "image_footnote" | "table_footnote") => "chart_footnote",
-        ("code", "image_footnote" | "table_footnote") => "code_footnote",
-        ("image", _) => "image_caption",
-        ("table", _) => "table_caption",
-        ("chart", _) => "chart_caption",
-        ("code", _) => "code_caption",
-        _ => return None,
-    };
-
-    Some(ParaChild {
-        child_type: child_type.to_string(),
-        bbox: block.bbox,
-        index,
-        content,
-    })
-}
-
-/// Associate raw caption/footnote blocks with the nearest visual/code parent.
-///
-/// Inputs:
-/// - `blocks`: raw page blocks in layout order.
-fn build_visual_child_parent_map(blocks: &[ContentBlock]) -> Vec<Option<usize>> {
-    let main_indices = blocks
-        .iter()
-        .enumerate()
-        .filter_map(|(index, block)| is_visual_main_raw_type(&block.block_type).then_some(index))
-        .collect::<Vec<_>>();
-    let mut parents = vec![None; blocks.len()];
-
-    for (child_index, block) in blocks.iter().enumerate() {
-        if !is_visual_child_type(&block.block_type) {
-            continue;
-        }
-        let is_footnote = block.block_type.ends_with("_footnote");
-        parents[child_index] = main_indices
-            .iter()
-            .copied()
-            .filter(|parent_index| !is_footnote || *parent_index < child_index)
-            .filter(|parent_index| visual_relation_is_clear(blocks, child_index, *parent_index))
-            .min_by_key(|parent_index| parent_index.abs_diff(child_index));
-    }
-
-    parents
-}
-
-fn visual_relation_is_clear(
-    blocks: &[ContentBlock],
-    child_index: usize,
-    parent_index: usize,
-) -> bool {
-    let start = child_index.min(parent_index) + 1;
-    let end = child_index.max(parent_index);
-    blocks[start..end].iter().all(|block| {
-        is_visual_child_type(&block.block_type)
-            || is_visual_relation_ignored_type(&block.block_type)
-    })
-}
-
-fn para_to_content_list_v1(page_index: usize, para: &ParaBlock) -> Option<Value> {
-    let mut value = match para.para_type.as_str() {
-        "text" | "ref_text" | "phonetic" | "header" | "footer" | "page_number" | "aside_text"
-        | "page_footnote" => json!({
-            "type": para.para_type,
-            "text": merge_text_v1(&para.content),
-        }),
-        "title" => json!({
-            "type": "text",
-            "text": merge_text_v1(&para.content),
-            "text_level": 1,
-        }),
-        "interline_equation" => json!({
-            "type": "equation",
-            "text": clean_interline_equation(&para.content),
-            "text_format": "latex",
-        }),
-        "image" => json!({
-            "type": "image",
-            "img_path": image_path_for_block(page_index, para.index),
-            "image_caption": child_texts_v1(para, "image_caption"),
-            "image_footnote": child_texts_v1(para, "image_footnote"),
-            "content": para.content.trim(),
-        }),
-        "table" => {
-            let mut table = json!({
-                "type": "table",
-                "img_path": image_path_for_block(page_index, para.index),
-                "table_caption": child_texts_v1(para, "table_caption"),
-                "table_footnote": child_texts_v1(para, "table_footnote"),
-            });
-            if !para.content.trim().is_empty() {
-                table["table_body"] = json!(para.content.trim());
-            }
-            table
-        }
-        "chart" => json!({
-            "type": "chart",
-            "img_path": image_path_for_block(page_index, para.index),
-            "chart_caption": child_texts_v1(para, "chart_caption"),
-            "chart_footnote": child_texts_v1(para, "chart_footnote"),
-            "content": para.content.trim(),
-        }),
-        "code" => {
-            let sub_type = para.sub_type.as_deref().unwrap_or("code");
-            let body = if sub_type == "code" {
-                format!("```txt\n{}\n```", para.content.trim())
-            } else {
-                para.content.trim().to_string()
-            };
-            json!({
-                "type": "code",
-                "sub_type": sub_type,
-                "code_caption": child_texts_v1(para, "code_caption"),
-                "code_body": body,
-            })
-        }
-        "list" => json!({
-            "type": "list",
-            "sub_type": para.sub_type.as_deref().unwrap_or("text"),
-            "list_items": text_lines(&para.content),
-        }),
-        _ => return None,
-    };
-
-    value["bbox"] = json!(bbox_to_content_list(para.bbox));
-    value["page_idx"] = json!(page_index);
-    Some(value)
-}
-
-fn para_to_content_list_v2(page_index: usize, para: &ParaBlock) -> Option<Value> {
-    let mut value = match para.para_type.as_str() {
-        "header" | "footer" | "aside_text" | "page_number" | "page_footnote" => {
-            let content_type = match para.para_type.as_str() {
-                "header" => "page_header",
-                "footer" => "page_footer",
-                "aside_text" => "page_aside_text",
-                "page_number" => "page_number",
-                "page_footnote" => "page_footnote",
-                _ => return None,
-            };
-            let mut content = serde_json::Map::new();
-            content.insert(
-                format!("{content_type}_content"),
-                Value::Array(spans_v2(&para.content)),
-            );
-            json!({
-                "type": content_type,
-                "content": content
-            })
-        }
-        "title" => json!({
-            "type": "title",
-            "content": {
-                "title_content": spans_v2(&para.content),
-                "level": 1,
-            }
-        }),
-        "text" | "phonetic" => json!({
-            "type": "paragraph",
-            "content": {
-                "paragraph_content": spans_v2(&para.content),
-            }
-        }),
-        "ref_text" => json!({
-            "type": "list",
-            "content": {
-                "list_type": "reference_list",
-                "list_items": [{
-                    "item_type": "text",
-                    "item_content": spans_v2(&para.content),
-                }],
-            }
-        }),
-        "interline_equation" => json!({
-            "type": "equation_interline",
-            "content": {
-                "math_content": clean_interline_equation(&para.content),
-                "math_type": "latex",
-                "image_source": {"path": image_path_for_block(page_index, para.index)},
-            }
-        }),
-        "image" => json!({
-            "type": "image",
-            "content": {
-                "image_source": {"path": image_path_for_block(page_index, para.index)},
-                "content": para.content.trim(),
-                "image_caption": child_spans_v2(para, "image_caption"),
-                "image_footnote": child_spans_v2(para, "image_footnote"),
-            }
-        }),
-        "table" => json!({
-            "type": "table",
-            "content": {
-                "image_source": {"path": image_path_for_block(page_index, para.index)},
-                "table_caption": child_spans_v2(para, "table_caption"),
-                "table_footnote": child_spans_v2(para, "table_footnote"),
-                "html": para.content.trim(),
-                "table_type": table_type(&para.content),
-                "table_nest_level": table_nest_level(&para.content),
-            }
-        }),
-        "chart" => json!({
-            "type": "chart",
-            "content": {
-                "image_source": {"path": image_path_for_block(page_index, para.index)},
-                "content": para.content.trim(),
-                "chart_caption": child_spans_v2(para, "chart_caption"),
-                "chart_footnote": child_spans_v2(para, "chart_footnote"),
-            }
-        }),
-        "code" => {
-            let sub_type = para.sub_type.as_deref().unwrap_or("code");
-            let content_type = if sub_type == "algorithm" {
-                "algorithm"
-            } else {
-                "code"
-            };
-            if content_type == "algorithm" {
-                json!({
-                    "type": content_type,
-                    "content": {
-                        "algorithm_caption": child_spans_v2(para, "code_caption"),
-                        "algorithm_content": spans_v2(&para.content),
-                    }
-                })
-            } else {
-                json!({
-                    "type": content_type,
-                    "content": {
-                        "code_caption": child_spans_v2(para, "code_caption"),
-                        "code_content": spans_v2(&para.content),
-                        "code_language": "txt",
-                    }
-                })
-            }
-        }
-        "list" => json!({
-            "type": "list",
-            "content": {
-                "list_type": "text_list",
-                "list_items": text_lines(&para.content)
-                    .into_iter()
-                    .map(|item| json!({
-                        "item_type": "text",
-                        "item_content": spans_v2(&item),
-                    }))
-                    .collect::<Vec<Value>>(),
-            }
-        }),
-        _ => return None,
-    };
-
-    value["bbox"] = json!(bbox_to_content_list(para.bbox));
-    Some(value)
-}
-
-fn para_to_middle_json(para: &ParaBlock) -> Value {
-    json!({
-        "type": para.para_type,
-        "bbox": para.bbox,
-        "index": para.index,
-        "content": para.content,
-        "sub_type": para.sub_type,
-        "blocks": para.children.iter().map(|child| json!({
-            "type": child.child_type,
-            "bbox": child.bbox,
-            "index": child.index,
-            "content": child.content,
-        })).collect::<Vec<Value>>(),
-    })
-}
-
-fn child_texts_v1(para: &ParaBlock, child_type: &str) -> Vec<String> {
-    para.children
-        .iter()
-        .filter(|child| child.child_type == child_type)
-        .map(|child| merge_text_v1(&child.content))
-        .collect()
-}
-
-fn child_spans_v2(para: &ParaBlock, child_type: &str) -> Vec<Value> {
-    para.children
-        .iter()
-        .filter(|child| child.child_type == child_type)
-        .flat_map(|child| spans_v2(&child.content))
-        .collect()
-}
-
-fn spans_v2(content: &str) -> Vec<Value> {
-    let content = merge_text_v2(content);
-    if content.trim().is_empty() {
-        Vec::new()
-    } else {
-        vec![json!({
-            "type": "text",
-            "content": content,
-        })]
-    }
-}
-
-fn text_lines(content: &str) -> Vec<String> {
-    content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn merge_text_v1(content: &str) -> String {
-    let content = normalize_text(content);
-    if content.is_empty() {
-        return String::new();
-    }
-    if contains_cjk(&content) {
-        content
-    } else if content.ends_with('-') {
-        content
-    } else {
-        format!("{content} ")
-    }
-}
-
-fn merge_text_v2(content: &str) -> String {
-    merge_text_v1(content)
-}
-
-fn normalize_text(content: &str) -> String {
-    content
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<&str>>()
-        .join(" ")
-}
-
-fn clean_interline_equation(content: &str) -> String {
-    let content = normalize_text(content);
-    content
-        .strip_prefix("\\[")
-        .unwrap_or(&content)
-        .strip_suffix("\\]")
-        .unwrap_or_else(|| content.as_str())
-        .trim()
-        .to_string()
-}
-
-fn contains_cjk(content: &str) -> bool {
-    content.chars().any(|ch| {
-        matches!(
-            ch as u32,
-            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0x3040..=0x30FF | 0xAC00..=0xD7AF
-        )
-    })
-}
-
-fn bbox_to_content_list(bbox: [f32; 4]) -> [i64; 4] {
-    bbox.map(|coord| ((coord.clamp(0.0, 1.0) as f64) * 1000.0).floor() as i64)
-}
-
-fn image_path_for_block(page_index: usize, block_index: usize) -> String {
-    format!("images/page_{page_index}_block_{block_index}.png")
-}
-
-fn table_nest_level(content: &str) -> usize {
-    if content.matches("<table").count() > 1 {
-        2
-    } else {
-        1
-    }
-}
-
-fn table_type(content: &str) -> &'static str {
-    if content.contains("colspan") || content.contains("rowspan") || table_nest_level(content) > 1 {
-        "complex_table"
-    } else {
-        "simple_table"
-    }
-}
-
-fn is_visual_main_raw_type(block_type: &str) -> bool {
-    matches!(
-        block_type,
-        "image" | "image_block" | "table" | "chart" | "code" | "algorithm"
-    )
-}
-
-fn is_visual_main_type(block_type: &str) -> bool {
-    matches!(block_type, "image" | "table" | "chart" | "code")
-}
-
-fn is_visual_child_type(block_type: &str) -> bool {
-    matches!(
-        block_type,
-        "image_caption" | "table_caption" | "code_caption" | "image_footnote" | "table_footnote"
-    )
-}
-
-fn is_visual_relation_ignored_type(block_type: &str) -> bool {
-    matches!(
-        block_type,
-        "header" | "footer" | "page_number" | "page_footnote" | "aside_text"
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use serde_json::{json, Value};
-
-    use crate::domain::models::ContentBlock;
-
-    use super::{bind_pdfium, build_page_content, parse_layout_output};
+    use super::{bind_pdfium, parse_layout_output};
 
     #[test]
     fn binds_bundled_pdfium() {
@@ -1227,103 +683,5 @@ mod tests {
             "<|box_start|>0 0 100 100<|box_end|><|ref_start|>inline_formula<|ref_end|>",
         );
         assert!(blocks.is_empty());
-    }
-
-    #[test]
-    fn content_list_maps_title_like_python() {
-        let page = build_page_content(
-            0,
-            &[block(
-                "title",
-                [0.34200001, 0.12399999, 0.65399998, 0.14499999],
-                "Attention Is All You Need",
-            )],
-        );
-
-        assert_eq!(
-            page.content_list[0],
-            json!({
-                "type": "text",
-                "text": "Attention Is All You Need ",
-                "text_level": 1,
-                "bbox": [342, 123, 653, 144],
-                "page_idx": 0
-            })
-        );
-    }
-
-    #[test]
-    fn content_list_nests_visual_caption_instead_of_emitting_raw_type() {
-        let page = build_page_content(
-            0,
-            &[
-                block("image_caption", [0.1, 0.1, 0.9, 0.2], "Figure 1"),
-                block("image", [0.1, 0.2, 0.9, 0.7], "A diagram"),
-            ],
-        );
-
-        let top_level_types = page
-            .content_list
-            .iter()
-            .filter_map(|value| value.get("type").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert_eq!(top_level_types, vec!["image"]);
-        assert_eq!(page.content_list[0]["image_caption"], json!(["Figure 1 "]));
-    }
-
-    #[test]
-    fn orphan_visual_caption_falls_back_to_text() {
-        let page = build_page_content(
-            0,
-            &[block(
-                "image_caption",
-                [0.1, 0.1, 0.9, 0.2],
-                "Unmatched caption",
-            )],
-        );
-
-        assert_eq!(page.content_list[0]["type"], "text");
-        assert_eq!(page.content_list[0]["text"], "Unmatched caption ");
-    }
-
-    #[test]
-    fn content_list_maps_equation_like_python() {
-        let page = build_page_content(
-            0,
-            &[block("equation", [0.0, 0.2, 1.0, 0.3], "\\[E=mc^2\\]")],
-        );
-
-        assert_eq!(
-            page.content_list[0],
-            json!({
-                "type": "equation",
-                "text": "E=mc^2",
-                "text_format": "latex",
-                "bbox": [0, 200, 1000, 300],
-                "page_idx": 0
-            })
-        );
-    }
-
-    #[test]
-    fn content_list_v2_uses_python_v2_shape() {
-        let page = build_page_content(0, &[block("title", [0.0, 0.0, 1.0, 0.1], "Intro")]);
-
-        assert_eq!(page.content_list[0]["type"], "text");
-        assert_eq!(page.content_list_v2[0]["type"], "title");
-        assert_eq!(
-            page.content_list_v2[0]["content"]["title_content"],
-            json!([{"type": "text", "content": "Intro "}])
-        );
-    }
-
-    fn block(block_type: &str, bbox: [f32; 4], content: &str) -> ContentBlock {
-        ContentBlock {
-            block_type: block_type.to_string(),
-            bbox,
-            angle: None,
-            content: Some(content.to_string()),
-            merge_prev: None,
-        }
     }
 }

@@ -304,8 +304,7 @@ fn insert_sampling_params(
     if !model_is_gpt {
         object.insert("skip_special_tokens".to_string(), json!(false));
     }
-    if !model_is_gpt && params.top_k.is_some() {
-        let value = params.top_k.expect("checked above");
+    if let (false, Some(value)) = (model_is_gpt, params.top_k) {
         object.insert("top_k".to_string(), json!(value));
     }
     if let Some(value) = params.presence_penalty {
@@ -314,8 +313,7 @@ fn insert_sampling_params(
     if let Some(value) = params.frequency_penalty {
         object.insert("frequency_penalty".to_string(), json!(value));
     }
-    if !model_is_gpt && params.repetition_penalty.is_some() {
-        let value = params.repetition_penalty.expect("checked above");
+    if let (false, Some(value)) = (model_is_gpt, params.repetition_penalty) {
         object.insert("repetition_penalty".to_string(), json!(value));
     }
     if let Some(value) = params.no_repeat_ngram_size {
