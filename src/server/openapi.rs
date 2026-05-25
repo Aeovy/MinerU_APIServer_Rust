@@ -1,4 +1,12 @@
-use serde_json::{json, Value};
+use serde_json::json;
+use utoipa::openapi::{
+    content::ContentBuilder,
+    encoding::EncodingBuilder,
+    path::ParameterStyle,
+    request_body::RequestBodyBuilder,
+    schema::{ArrayBuilder, KnownFormat, ObjectBuilder, SchemaFormat, SchemaType, Type},
+    Required,
+};
 use utoipa::{Modify, OpenApi};
 
 #[derive(OpenApi)]
@@ -33,6 +41,11 @@ impl Modify for MultipartSchema {
     }
 }
 
+/// Replace utoipa's empty multipart schema with MinerU-compatible form fields.
+///
+/// Inputs:
+/// - `openapi`: generated OpenAPI document to patch.
+/// - `path`: API path whose POST operation accepts multipart form data.
 fn set_multipart_schema(openapi: &mut utoipa::openapi::OpenApi, path: &str) {
     let Some(operation) = openapi
         .paths
@@ -42,63 +55,99 @@ fn set_multipart_schema(openapi: &mut utoipa::openapi::OpenApi, path: &str) {
     else {
         return;
     };
-    operation.request_body = serde_json::from_value(json!({
-            "required": true,
-            "content": {
-                "multipart/form-data": {
-                    "schema": {
-                        "type": "object",
-                        "required": ["files"],
-                        "properties": multipart_form_properties()
-                    },
-                    "encoding": {
-                        "files": { "style": "form", "explode": true },
-                        "lang_list": { "style": "form", "explode": true }
-                    }
-                }
-            }
-        }))
-        .ok();
+
+    let form_encoding = EncodingBuilder::new()
+        .style(Some(ParameterStyle::Form))
+        .explode(Some(true))
+        .build();
+
+    operation.request_body = Some(
+        RequestBodyBuilder::new()
+            .required(Some(Required::True))
+            .content(
+                "multipart/form-data",
+                ContentBuilder::new()
+                    .schema(Some(multipart_form_schema()))
+                    .encoding("files", form_encoding.clone())
+                    .encoding("lang_list", form_encoding)
+                    .build(),
+            )
+            .build(),
+    );
 }
 
-fn multipart_form_properties() -> Value {
-    json!({
-        "files": {
-            "type": "array",
-            "items": { "type": "string", "format": "binary" },
-            "description": "Upload PDF or image files for parsing"
-        },
-        "lang_list": {
-            "type": "array",
-            "items": { "type": "string" },
-            "default": ["ch"]
-        },
-        "backend": {
-            "type": "string",
-            "default": "vlm-http-client",
-            "enum": ["vlm-http-client", "vllm-http-client"]
-        },
-        "parse_method": {
-            "type": "string",
-            "default": "auto",
-            "enum": ["auto", "txt", "ocr"]
-        },
-        "formula_enable": { "type": "boolean", "default": true },
-        "table_enable": { "type": "boolean", "default": true },
-        "image_analysis": { "type": "boolean", "default": true },
-        "server_url": {
-            "type": "string",
-            "nullable": true,
-            "description": "OpenAI-compatible VLM server URL"
-        },
-        "return_md": { "type": "boolean", "default": true },
-        "return_middle_json": { "type": "boolean", "default": false },
-        "return_model_output": { "type": "boolean", "default": false },
-        "return_content_list": { "type": "boolean", "default": false },
-        "return_images": { "type": "boolean", "default": false },
-        "response_format_zip": { "type": "boolean", "default": false },
-        "return_original_file": { "type": "boolean", "default": false },
-        "start_page_id": { "type": "integer", "default": 0, "minimum": 0 },
-        "end_page_id": { "type": "integer", "default": 99999, "minimum": 0 }
-    })
+/// Build the documented request body object used by `/file_parse` and `/tasks`.
+fn multipart_form_schema() -> ObjectBuilder {
+    ObjectBuilder::new()
+        .schema_type(Type::Object)
+        .required("files")
+        .property(
+            "files",
+            ArrayBuilder::new()
+                .items(
+                    ObjectBuilder::new()
+                        .schema_type(Type::String)
+                        .format(Some(SchemaFormat::KnownFormat(KnownFormat::Binary))),
+                )
+                .description(Some("Upload PDF or image files for parsing")),
+        )
+        .property(
+            "lang_list",
+            ArrayBuilder::new()
+                .items(ObjectBuilder::new().schema_type(Type::String))
+                .default(Some(json!(["ch"]))),
+        )
+        .property(
+            "backend",
+            ObjectBuilder::new()
+                .schema_type(Type::String)
+                .default(Some(json!("vlm-http-client")))
+                .enum_values(Some(["vlm-http-client", "vllm-http-client"])),
+        )
+        .property(
+            "parse_method",
+            ObjectBuilder::new()
+                .schema_type(Type::String)
+                .default(Some(json!("auto")))
+                .enum_values(Some(["auto", "txt", "ocr"])),
+        )
+        .property("formula_enable", boolean_schema(true))
+        .property("table_enable", boolean_schema(true))
+        .property("image_analysis", boolean_schema(true))
+        .property(
+            "server_url",
+            ObjectBuilder::new()
+                .schema_type(SchemaType::from_iter([Type::String, Type::Null]))
+                .description(Some("OpenAI-compatible VLM server URL")),
+        )
+        .property("return_md", boolean_schema(true))
+        .property("return_middle_json", boolean_schema(false))
+        .property("return_model_output", boolean_schema(false))
+        .property("return_content_list", boolean_schema(false))
+        .property("return_images", boolean_schema(false))
+        .property("response_format_zip", boolean_schema(false))
+        .property("return_original_file", boolean_schema(false))
+        .property("start_page_id", page_id_schema(0))
+        .property("end_page_id", page_id_schema(99999))
+}
+
+/// Build a boolean schema with the MinerU-compatible default value.
+///
+/// Inputs:
+/// - `default`: default value shown to OpenAPI clients and Swagger UI.
+fn boolean_schema(default: bool) -> ObjectBuilder {
+    ObjectBuilder::new()
+        .schema_type(Type::Boolean)
+        .default(Some(json!(default)))
+}
+
+/// Build a non-negative page id schema with the provided default.
+///
+/// Inputs:
+/// - `default`: default page index used when the form field is omitted.
+fn page_id_schema(default: i32) -> ObjectBuilder {
+    ObjectBuilder::new()
+        .schema_type(Type::Integer)
+        .default(Some(json!(default)))
+        .minimum(Some(0))
 }

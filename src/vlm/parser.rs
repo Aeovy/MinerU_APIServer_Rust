@@ -515,7 +515,12 @@ fn blocks_to_content_list(page_index: usize, blocks: &[ContentBlock]) -> Vec<Val
 
 #[cfg(test)]
 mod tests {
-    use super::parse_layout_output;
+    use super::{bind_pdfium, parse_layout_output};
+
+    #[test]
+    fn binds_bundled_pdfium() {
+        bind_pdfium().expect("bundled PDFium should be available after build");
+    }
 
     #[test]
     fn parses_layout_blocks() {
