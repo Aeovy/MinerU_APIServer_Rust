@@ -548,11 +548,18 @@ mod tests {
 
     use axum::{
         body::to_bytes,
-        http::{header, StatusCode},
+        http::{header, Request, StatusCode},
+        routing::get,
+        Router,
     };
     use chrono::Utc;
     use image::{ImageBuffer, ImageFormat, Rgb};
     use tempfile::tempdir;
+    use tower::ServiceExt;
+    use tower_http::compression::{
+        predicate::{DefaultPredicate, NotForContentType, Predicate},
+        CompressionLayer,
+    };
     use uuid::Uuid;
     use zip::ZipArchive;
 
@@ -615,6 +622,53 @@ mod tests {
         let mut original_bytes = Vec::new();
         original.read_to_end(&mut original_bytes).expect("read pdf");
         assert!(original_bytes.starts_with(b"%PDF"));
+    }
+
+    #[tokio::test]
+    async fn zip_response_is_not_http_gzip_compressed() {
+        let temp = tempdir().expect("temp dir");
+        let upload_path = temp.path().join("sample.png");
+        let image = ImageBuffer::from_pixel(4, 3, Rgb([255_u8, 0, 0]));
+        image
+            .save_with_format(&upload_path, ImageFormat::Png)
+            .expect("png fixture");
+        let task = completed_zip_task(temp.path().to_path_buf(), upload_path);
+        let app = Router::new()
+            .route(
+                "/zip",
+                get(move || {
+                    let task = task.clone();
+                    async move {
+                        ResultBuilder::build_response(&task, StatusCode::OK, "sample.zip").await
+                    }
+                }),
+            )
+            .layer(CompressionLayer::new().compress_when(
+                DefaultPredicate::new().and(NotForContentType::const_new("application/zip")),
+            ));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/zip")
+                    .header(header::ACCEPT_ENCODING, "gzip")
+                    .body(axum::body::Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("zip route should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/zip"
+        );
+        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
+        let bytes = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should read");
+        assert!(bytes.starts_with(b"PK\x03\x04"));
+        assert!(!bytes.starts_with(&[0x1f, 0x8b, 0x08]));
     }
 
     fn completed_zip_task(
