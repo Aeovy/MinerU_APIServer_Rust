@@ -1637,6 +1637,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "crc32fast",
  "futures",
  "image",
  "md-5",
