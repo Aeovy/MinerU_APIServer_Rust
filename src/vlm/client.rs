@@ -10,13 +10,15 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use reqwest::header::{HeaderMap, AUTHORIZATION};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::{sync::Mutex, time::sleep};
 
 use crate::error::{ApiError, ApiResult};
 
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 const DEFAULT_USER_PROMPT: &str = "What is the text in the illustrate?";
 const END_TOKEN_ENV: &str = "MINERU_VLM_END_TOKEN";
+const CHAT_COMPLETION_MAX_ATTEMPTS: usize = 3;
+const CHAT_COMPLETION_RETRY_DELAYS_MS: [u64; 2] = [200, 500];
 
 #[derive(Debug, Clone)]
 struct MineruOpenAiConfig {
@@ -92,11 +94,16 @@ impl SamplingParams {
 
 #[derive(Debug, Clone)]
 pub struct VlmRequest {
-    pub server_url: Option<String>,
     pub prompt: String,
     pub image_png: Option<Vec<u8>>,
     pub sampling_params: SamplingParams,
     pub priority: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VlmSession {
+    base_url: String,
+    model_name: String,
 }
 
 pub struct VlmHttpClient {
@@ -123,28 +130,97 @@ impl VlmHttpClient {
         }
     }
 
-    /// Send an OpenAI-compatible chat completion request for one MinerU VLM step.
+    /// Build a VLM session for one parser request so all chat calls reuse the same model.
     ///
     /// Inputs:
-    /// - `request`: prompt, optional image, sampling params, and server URL.
-    pub async fn predict(&self, request: VlmRequest) -> ApiResult<String> {
+    /// - `server_url`: optional multipart server URL overriding the environment default.
+    pub async fn session_for_request(&self, server_url: Option<&str>) -> ApiResult<VlmSession> {
+        let base_url = resolve_server_url(server_url)?;
+        self.session_for_base_url(&base_url).await
+    }
+
+    /// Send one chat completion through an already resolved VLM session.
+    ///
+    /// Inputs:
+    /// - `session`: per-request server/model context.
+    /// - `request`: prompt, optional image, sampling params, and priority.
+    pub async fn predict_with_session(
+        &self,
+        session: &VlmSession,
+        request: VlmRequest,
+    ) -> ApiResult<String> {
         let started_at = Instant::now();
-        let base_url = resolve_server_url(request.server_url.as_deref())?;
         let prompt_kind = prompt_kind(&request.prompt);
         let image_bytes = request.image_png.as_ref().map(Vec::len).unwrap_or_default();
-        let model_name = self.resolve_model_name_cached(&base_url).await?;
-        let body = build_chat_body(&model_name, &request);
-        let request_started_at = Instant::now();
-        let data: Value = self
-            .openai_client(&base_url)
-            .chat()
-            .create_byot(body)
-            .await?;
-        let request_elapsed_ms = request_started_at.elapsed().as_millis();
+        let body = build_chat_body(&session.model_name, &request);
+        let mut attempt_count = 0_usize;
+        let (data, request_elapsed_ms) = loop {
+            let attempt = attempt_count + 1;
+            let request_started_at = Instant::now();
+            match self
+                .openai_client(&session.base_url)
+                .chat()
+                .create_byot(body.clone())
+                .await
+            {
+                Ok(data) => {
+                    let request_elapsed_ms = request_started_at.elapsed().as_millis();
+                    if attempt > 1 {
+                        tracing::debug!(
+                            base_url = %session.base_url,
+                            model_name = %session.model_name,
+                            prompt_kind,
+                            image_bytes,
+                            attempt,
+                            request_ms = request_elapsed_ms,
+                            elapsed_ms = started_at.elapsed().as_millis(),
+                            "vlm chat completion retry succeeded"
+                        );
+                    }
+                    break (data, request_elapsed_ms);
+                }
+                Err(error)
+                    if attempt < CHAT_COMPLETION_MAX_ATTEMPTS
+                        && should_retry_chat_error(&error) =>
+                {
+                    let delay_ms = CHAT_COMPLETION_RETRY_DELAYS_MS
+                        .get(attempt - 1)
+                        .copied()
+                        .unwrap_or(500);
+                    tracing::debug!(
+                        base_url = %session.base_url,
+                        model_name = %session.model_name,
+                        prompt_kind,
+                        image_bytes,
+                        attempt,
+                        delay_ms,
+                        request_ms = request_started_at.elapsed().as_millis(),
+                        error = %error,
+                        "vlm chat completion retrying after transport error"
+                    );
+                    attempt_count += 1;
+                    sleep(Duration::from_millis(delay_ms)).await;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        base_url = %session.base_url,
+                        model_name = %session.model_name,
+                        prompt_kind,
+                        image_bytes,
+                        attempt,
+                        request_ms = request_started_at.elapsed().as_millis(),
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        error = %error,
+                        "vlm chat completion failed"
+                    );
+                    return Err(ApiError::from(error));
+                }
+            }
+        };
         let content = parse_chat_content(&data)?;
         tracing::debug!(
-            base_url = %base_url,
-            model_name = %model_name,
+            base_url = %session.base_url,
+            model_name = %session.model_name,
             prompt_kind,
             image_bytes,
             content_chars = content.chars().count(),
@@ -155,6 +231,14 @@ impl VlmHttpClient {
         Ok(content)
     }
 
+    async fn session_for_base_url(&self, base_url: &str) -> ApiResult<VlmSession> {
+        let model_name = self.resolve_model_name_cached(base_url).await?;
+        Ok(VlmSession {
+            base_url: base_url.to_string(),
+            model_name,
+        })
+    }
+
     /// Resolve and cache the model name for one OpenAI-compatible VLM server.
     ///
     /// Inputs:
@@ -162,7 +246,7 @@ impl VlmHttpClient {
     async fn resolve_model_name_cached(&self, base_url: &str) -> ApiResult<String> {
         let mut cache = self.model_name_cache.lock().await;
         if let Some(model_name) = cache.get(base_url).cloned() {
-            tracing::debug!(
+            tracing::trace!(
                 base_url,
                 model_name = %model_name,
                 "vlm model name resolved from cache"
@@ -188,7 +272,11 @@ impl VlmHttpClient {
         if let Ok(model_name) = env::var("MINERU_VL_MODEL_NAME") {
             let trimmed = model_name.trim();
             if !trimmed.is_empty() {
-                self.check_model_name(base_url, trimmed).await?;
+                tracing::debug!(
+                    base_url,
+                    model_name = trimmed,
+                    "vlm model name resolved from environment"
+                );
                 return Ok(trimmed.to_string());
             }
         }
@@ -209,17 +297,6 @@ impl VlmHttpClient {
                     "Model name is empty in response from {base_url}. Response body: {payload}"
                 ))
             })
-    }
-
-    async fn check_model_name(&self, base_url: &str, model_name: &str) -> ApiResult<()> {
-        let payload = self.list_models(base_url).await?;
-        let models = model_list_from_payload(base_url, &payload)?;
-        if models.iter().any(|id| id == model_name) {
-            return Ok(());
-        }
-        Err(ApiError::BadRequest(format!(
-            "Model '{model_name}' not found in the response from {base_url}/v1/models. Please check if the model is available on the server."
-        )))
     }
 
     async fn list_models(&self, base_url: &str) -> ApiResult<Value> {
@@ -277,6 +354,19 @@ fn prompt_kind(prompt: &str) -> &'static str {
         "image"
     } else {
         "text"
+    }
+}
+
+fn should_retry_chat_error(error: &async_openai::error::OpenAIError) -> bool {
+    match error {
+        async_openai::error::OpenAIError::Reqwest(error) => {
+            error.is_request() || error.is_connect() || error.is_timeout()
+        }
+        async_openai::error::OpenAIError::ApiError(error) => {
+            error.api_error.code.as_deref() == Some("rate_limit_exceeded")
+                || error.api_error.r#type.as_deref() == Some("server_error")
+        }
+        _ => false,
     }
 }
 
@@ -447,12 +537,9 @@ fn model_list_from_payload(base_url: &str, payload: &Value) -> ApiResult<Vec<Str
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        env,
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        },
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
     };
 
     use axum::{routing::get, Json, Router};
@@ -460,38 +547,9 @@ mod tests {
     use serde_json::json;
     use tokio::{net::TcpListener, sync::oneshot, time::Duration};
 
+    use crate::vlm::test_env::{EnvVarGuard, TEST_ENV_LOCK};
+
     use super::{parse_chat_content, VlmHttpClient};
-
-    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: &str) -> Self {
-            let previous = env::var(name).ok();
-            env::set_var(name, value);
-            Self { name, previous }
-        }
-
-        fn unset(name: &'static str) -> Self {
-            let previous = env::var(name).ok();
-            env::remove_var(name);
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.previous {
-                env::set_var(self.name, value);
-            } else {
-                env::remove_var(self.name);
-            }
-        }
-    }
 
     async fn spawn_models_server(
         counter: Arc<AtomicUsize>,
@@ -577,5 +635,24 @@ mod tests {
             assert_eq!(result.unwrap(), "cached-model");
         }
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn uses_configured_model_name_without_listing_models() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let _model_name = EnvVarGuard::set("MINERU_VL_MODEL_NAME", "configured-model");
+        let _no_proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1,localhost");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (base_url, server) = spawn_models_server(counter.clone()).await;
+        let client = VlmHttpClient::new();
+
+        let model_name = client
+            .resolve_model_name_cached(&base_url)
+            .await
+            .expect("configured model name should resolve");
+
+        server.abort();
+        assert_eq!(model_name, "configured-model");
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
     }
 }

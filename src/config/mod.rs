@@ -7,6 +7,7 @@ pub const MINERU_VERSION: &str = "3.1.15";
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 3;
 pub const DEFAULT_PROCESSING_WINDOW_SIZE: usize = 64;
 pub const DEFAULT_VLM_MAX_CONCURRENCY: usize = 100;
+pub const DEFAULT_IMAGE_PREPROCESS_THREADS: usize = 0;
 pub const DEFAULT_TASK_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS: u64 = 5 * 60;
 pub const DEFAULT_OUTPUT_ROOT: &str = "./output";
@@ -34,6 +35,7 @@ pub struct ServiceConfig {
     pub max_concurrent_requests: usize,
     pub processing_window_size: usize,
     pub vlm_max_concurrency: usize,
+    pub image_preprocess_threads: usize,
     pub task_retention: Duration,
     pub task_cleanup_interval: Duration,
 }
@@ -61,6 +63,11 @@ impl ServiceConfig {
         );
         let vlm_max_concurrency =
             read_usize_env("MINERU_VLM_MAX_CONCURRENCY", DEFAULT_VLM_MAX_CONCURRENCY, 1);
+        let image_preprocess_threads = read_usize_env(
+            "MINERU_IMAGE_PREPROCESS_THREADS",
+            default_image_preprocess_threads(),
+            1,
+        );
         let task_retention = Duration::from_secs(read_u64_env(
             "MINERU_API_TASK_RETENTION_SECONDS",
             DEFAULT_TASK_RETENTION_SECONDS,
@@ -82,6 +89,7 @@ impl ServiceConfig {
             max_concurrent_requests,
             processing_window_size,
             vlm_max_concurrency,
+            image_preprocess_threads,
             task_retention,
             task_cleanup_interval,
         }
@@ -115,6 +123,13 @@ fn read_u64_env(name: &str, default: u64, minimum: u64) -> u64 {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value >= minimum)
         .unwrap_or(default)
+}
+
+fn default_image_preprocess_threads() -> usize {
+    match DEFAULT_IMAGE_PREPROCESS_THREADS {
+        0 => num_cpus::get().max(1),
+        value => value.max(1),
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +177,46 @@ mod tests {
             env::set_var("MINERU_VLM_MAX_CONCURRENCY", value);
         } else {
             env::remove_var("MINERU_VLM_MAX_CONCURRENCY");
+        }
+    }
+
+    #[test]
+    fn reads_image_preprocess_threads_with_auto_default_and_minimum() {
+        let previous = env::var("MINERU_IMAGE_PREPROCESS_THREADS").ok();
+        let args = CliArgs {
+            host: "127.0.0.1".to_string(),
+            port: 34000,
+            allow_public_http_client: false,
+        };
+
+        env::remove_var("MINERU_IMAGE_PREPROCESS_THREADS");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).image_preprocess_threads,
+            num_cpus::get().max(1)
+        );
+
+        env::set_var("MINERU_IMAGE_PREPROCESS_THREADS", "0");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).image_preprocess_threads,
+            num_cpus::get().max(1)
+        );
+
+        env::set_var("MINERU_IMAGE_PREPROCESS_THREADS", "5");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).image_preprocess_threads,
+            5
+        );
+
+        env::set_var("MINERU_IMAGE_PREPROCESS_THREADS", "not-a-number");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).image_preprocess_threads,
+            num_cpus::get().max(1)
+        );
+
+        if let Some(value) = previous {
+            env::set_var("MINERU_IMAGE_PREPROCESS_THREADS", value);
+        } else {
+            env::remove_var("MINERU_IMAGE_PREPROCESS_THREADS");
         }
     }
 }

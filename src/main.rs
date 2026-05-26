@@ -39,6 +39,7 @@ async fn main() -> anyhow::Result<()> {
         max_concurrent_requests = config.max_concurrent_requests,
         processing_window_size = config.processing_window_size,
         vlm_max_concurrency = config.vlm_max_concurrency,
+        image_preprocess_threads = config.image_preprocess_threads,
         public_bind_exposed = config.public_bind_exposed,
         allow_public_http_client = config.allow_public_http_client,
         "MinerU API server started"

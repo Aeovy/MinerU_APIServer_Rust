@@ -37,6 +37,7 @@ impl AppState {
             client,
             config.processing_window_size,
             config.vlm_max_concurrency,
+            config.image_preprocess_threads,
         ));
         let request_semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         let state = Self {

@@ -6,9 +6,13 @@ use std::{
     time::Instant,
 };
 
+use fast_image_resize::{
+    images::Image as FastImage, pixels::PixelType, FilterType, ResizeAlg, ResizeOptions, Resizer,
+};
 use futures::{stream, StreamExt};
 use image::{imageops, DynamicImage, GenericImageView, ImageFormat, Rgba};
 use pdfium_render::prelude::*;
+use rayon::prelude::*;
 use tokio::{fs, sync::Semaphore};
 
 use crate::{
@@ -18,7 +22,7 @@ use crate::{
 
 use super::client::{
     layout_prompt, layout_sampling_params, prompt_for_block, sampling_params_for_block,
-    VlmHttpClient, VlmRequest,
+    VlmHttpClient, VlmRequest, VlmSession,
 };
 use super::python_compat::{build_document_output, PythonPageInput};
 
@@ -32,6 +36,7 @@ pub struct VlmDocumentParser {
     client: Arc<VlmHttpClient>,
     processing_window_size: usize,
     vlm_max_concurrency: usize,
+    image_preprocess_pool: Arc<rayon::ThreadPool>,
 }
 
 struct PageParseResult {
@@ -81,16 +86,28 @@ struct RenderedPageWindow {
     next_page_id: usize,
 }
 
+struct PreparedLayoutImage {
+    image_png: Vec<u8>,
+    prepare_ms: u128,
+}
+
 impl VlmDocumentParser {
     pub fn new(
         client: Arc<VlmHttpClient>,
         processing_window_size: usize,
         vlm_max_concurrency: usize,
+        image_preprocess_threads: usize,
     ) -> Self {
+        let image_preprocess_pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(image_preprocess_threads.max(1))
+            .thread_name(|index| format!("mineru-image-preprocess-{index}"))
+            .build()
+            .expect("image preprocess thread pool configuration must be valid");
         Self {
             client,
             processing_window_size,
             vlm_max_concurrency: vlm_max_concurrency.max(1),
+            image_preprocess_pool: Arc::new(image_preprocess_pool),
         }
     }
 
@@ -143,6 +160,17 @@ impl VlmDocumentParser {
     ) -> ApiResult<ParsedDocument> {
         let started_at = Instant::now();
         let limiter = Arc::new(Semaphore::new(self.vlm_max_concurrency));
+        let session_started_at = Instant::now();
+        let session = self
+            .client
+            .session_for_request(task.server_url.as_deref())
+            .await?;
+        tracing::debug!(
+            task_id = %task.task_id,
+            file_name = %upload.stem,
+            elapsed_ms = session_started_at.elapsed().as_millis(),
+            "vlm session resolved"
+        );
         let mut page_results = Vec::new();
         tracing::debug!(
             task_id = %task.task_id,
@@ -199,7 +227,7 @@ impl VlmDocumentParser {
                 );
                 let parse_window_started_at = Instant::now();
                 page_results.extend(
-                    self.parse_page_window(task, window.pages, limiter.clone())
+                    self.parse_page_window(task, &session, window.pages, limiter.clone())
                         .await?,
                 );
                 tracing::debug!(
@@ -226,7 +254,10 @@ impl VlmDocumentParser {
                 "image pages loaded"
             );
             let parse_window_started_at = Instant::now();
-            page_results.extend(self.parse_page_window(task, pages, limiter.clone()).await?);
+            page_results.extend(
+                self.parse_page_window(task, &session, pages, limiter.clone())
+                    .await?,
+            );
             tracing::debug!(
                 task_id = %task.task_id,
                 file_name = %upload.stem,
@@ -288,6 +319,7 @@ impl VlmDocumentParser {
     async fn parse_page_window(
         &self,
         task: &ParseTask,
+        session: &VlmSession,
         pages: Vec<RenderedPage>,
         limiter: Arc<Semaphore>,
     ) -> ApiResult<Vec<PageParseResult>> {
@@ -306,7 +338,7 @@ impl VlmDocumentParser {
         let unordered_layouts = stream::iter(
             pages
                 .into_iter()
-                .map(|page| self.detect_page_layout(task, page, limiter.clone())),
+                .map(|page| self.detect_page_layout(task, session, page, limiter.clone())),
         )
         .buffer_unordered(self.vlm_max_concurrency)
         .collect::<Vec<_>>()
@@ -318,12 +350,16 @@ impl VlmDocumentParser {
         let layout_elapsed_ms = layout_started_at.elapsed().as_millis();
 
         let prepare_started_at = Instant::now();
-        let mut jobs = Vec::new();
-        let mut block_count = 0_usize;
-        for layout in &layouts {
-            block_count += layout.blocks.len();
-            jobs.extend(prepare_block_extract_jobs(task, layout)?);
-        }
+        let block_count = layouts
+            .iter()
+            .map(|layout| layout.blocks.len())
+            .sum::<usize>();
+        let jobs = prepare_window_extract_jobs_async(
+            self.image_preprocess_pool.clone(),
+            task.image_analysis,
+            &layouts,
+        )
+        .await?;
         let job_count = jobs.len();
         tracing::debug!(
             task_id = %task.task_id,
@@ -338,15 +374,9 @@ impl VlmDocumentParser {
         );
 
         let extract_started_at = Instant::now();
-        let unordered_extracts = stream::iter(jobs.into_iter().map(|job| {
-            self.extract_block(task, page_priority(job.page_index), job, limiter.clone())
-        }))
-        .buffer_unordered(self.vlm_max_concurrency)
-        .collect::<Vec<_>>()
-        .await;
-        let mut extracts = unordered_extracts
-            .into_iter()
-            .collect::<ApiResult<Vec<BlockExtractResult>>>()?;
+        let mut extracts = self
+            .extract_window_blocks(task, session, jobs, limiter.clone())
+            .await?;
         extracts.sort_by_key(|result| (result.page_index, result.block_index));
         let extract_elapsed_ms = extract_started_at.elapsed().as_millis();
 
@@ -409,24 +439,26 @@ impl VlmDocumentParser {
     async fn detect_page_layout(
         &self,
         task: &ParseTask,
+        session: &VlmSession,
         page: RenderedPage,
         limiter: Arc<Semaphore>,
     ) -> ApiResult<PageLayoutResult> {
         let started_at = Instant::now();
         let page_index = page.page_index;
         let page_image = page.image;
-        let prepare_started_at = Instant::now();
-        let layout_image = encode_png(&prepare_layout_image(&page_image)?)?;
-        let layout_image_len = layout_image.len();
-        let prepare_elapsed_ms = prepare_started_at.elapsed().as_millis();
+        let prepared_layout =
+            prepare_layout_image_png_async(self.image_preprocess_pool.clone(), page_image.clone())
+                .await?;
+        let layout_image_len = prepared_layout.image_png.len();
+        let prepare_elapsed_ms = prepared_layout.prepare_ms;
         let predict_started_at = Instant::now();
         let layout_output = self
             .predict_with_limit(
                 &limiter,
+                session,
                 VlmRequest {
-                    server_url: task.server_url.clone(),
                     prompt: layout_prompt().to_string(),
-                    image_png: Some(layout_image),
+                    image_png: Some(prepared_layout.image_png),
                     sampling_params: layout_sampling_params(),
                     priority: page_priority(page_index),
                 },
@@ -468,6 +500,7 @@ impl VlmDocumentParser {
     async fn extract_block(
         &self,
         task: &ParseTask,
+        session: &VlmSession,
         priority: Option<i32>,
         job: BlockExtractJob,
         limiter: Arc<Semaphore>,
@@ -482,8 +515,8 @@ impl VlmDocumentParser {
         let content = self
             .predict_with_limit(
                 &limiter,
+                session,
                 VlmRequest {
-                    server_url: task.server_url.clone(),
                     prompt: prompt_for_block(&job.block_type).to_string(),
                     image_png: Some(image_png),
                     sampling_params: sampling_params_for_block(&job.block_type),
@@ -510,6 +543,46 @@ impl VlmDocumentParser {
         })
     }
 
+    /// Extract one prepared block window with fail-fast error handling.
+    ///
+    /// Inputs:
+    /// - `jobs`: block crop requests already prepared as PNG bytes.
+    /// - `limiter`: shared VLM request limiter for this document.
+    async fn extract_window_blocks(
+        &self,
+        task: &ParseTask,
+        session: &VlmSession,
+        jobs: Vec<BlockExtractJob>,
+        limiter: Arc<Semaphore>,
+    ) -> ApiResult<Vec<BlockExtractResult>> {
+        let mut extracts = Vec::with_capacity(jobs.len());
+        let mut pending = stream::iter(jobs.into_iter().map(|job| {
+            self.extract_block(
+                task,
+                session,
+                page_priority(job.page_index),
+                job,
+                limiter.clone(),
+            )
+        }))
+        .buffer_unordered(self.vlm_max_concurrency);
+
+        while let Some(result) = pending.next().await {
+            match result {
+                Ok(extract) => extracts.push(extract),
+                Err(error) => {
+                    tracing::debug!(
+                        error = %error.detail(),
+                        completed_extract_count = extracts.len(),
+                        "block extraction failed; cancelling remaining window requests"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Ok(extracts)
+    }
+
     /// Execute one VLM request under the per-document concurrency limit.
     ///
     /// Inputs:
@@ -518,6 +591,7 @@ impl VlmDocumentParser {
     async fn predict_with_limit(
         &self,
         limiter: &Arc<Semaphore>,
+        session: &VlmSession,
         request: VlmRequest,
     ) -> ApiResult<String> {
         let wait_started_at = Instant::now();
@@ -528,11 +602,13 @@ impl VlmDocumentParser {
             .map_err(|error| ApiError::Internal(error.to_string()))?;
         let wait_elapsed_ms = wait_started_at.elapsed().as_millis();
         let predict_started_at = Instant::now();
-        let result = self.client.predict(request).await;
+        let result = self.client.predict_with_session(session, request).await;
+        let error_detail = result.as_ref().err().map(ApiError::detail);
         tracing::debug!(
             wait_permit_ms = wait_elapsed_ms,
             vlm_request_ms = predict_started_at.elapsed().as_millis(),
             ok = result.is_ok(),
+            error = error_detail.as_deref(),
             "vlm request completed under limiter"
         );
         result
@@ -646,16 +722,54 @@ impl VlmDocumentParser {
     }
 }
 
+/// Prepare all block extraction jobs for one rendered window on the image thread pool.
+///
+/// Inputs:
+/// - `pool`: shared CPU pool for crop, resize, and PNG encode work.
+/// - `image_analysis`: request option controlling skipped image/chart blocks.
+/// - `layouts`: ordered page layouts with source page images.
+async fn prepare_window_extract_jobs_async(
+    pool: Arc<rayon::ThreadPool>,
+    image_analysis: bool,
+    layouts: &[PageLayoutResult],
+) -> ApiResult<Vec<BlockExtractJob>> {
+    let layout_inputs = layouts
+        .iter()
+        .map(|layout| PageExtractInput {
+            page_index: layout.page_index,
+            page_image: layout.page_image.clone(),
+            blocks: layout.blocks.clone(),
+        })
+        .collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        pool.install(|| {
+            layout_inputs
+                .into_par_iter()
+                .map(|layout| prepare_block_extract_jobs(image_analysis, layout))
+                .collect::<ApiResult<Vec<Vec<BlockExtractJob>>>>()
+                .map(|page_jobs| page_jobs.into_iter().flatten().collect())
+        })
+    })
+    .await
+    .map_err(|error| ApiError::Internal(error.to_string()))?
+}
+
+struct PageExtractInput {
+    page_index: usize,
+    page_image: DynamicImage,
+    blocks: Vec<ContentBlock>,
+}
+
 /// Prepare all block extraction jobs for one page after layout detection.
 ///
 /// Inputs:
-/// - `task`: request options controlling skipped block types.
-/// - `layout`: page layout result with source page image and detected blocks.
+/// - `image_analysis`: request option controlling skipped block types.
+/// - `layout`: page image and detected blocks.
 fn prepare_block_extract_jobs(
-    task: &ParseTask,
-    layout: &PageLayoutResult,
+    image_analysis: bool,
+    layout: PageExtractInput,
 ) -> ApiResult<Vec<BlockExtractJob>> {
-    let skip_types = skip_extract_types(task.image_analysis);
+    let skip_types = skip_extract_types(image_analysis);
     let mut jobs = Vec::new();
     for (block_index, block) in layout.blocks.iter().enumerate() {
         if skip_types.contains(block.block_type.as_str()) {
@@ -747,21 +861,17 @@ fn render_pdf_page_window(
         .load_pdf_from_byte_slice(bytes, None)
         .map_err(|error| ApiError::BadRequest(format!("Failed to open PDF: {error}")))?;
     let page_count = document.pages().len() as usize;
-    if page_count == 0 {
+    let Some((start, window_end, next_page_id)) = pdf_page_window_bounds(
+        page_count,
+        start_page_id,
+        end_page_id,
+        processing_window_size,
+    ) else {
         return Ok(RenderedPageWindow {
             pages: Vec::new(),
-            next_page_id: end_page_id.saturating_add(1),
+            next_page_id: start_page_id,
         });
-    }
-    let start = start_page_id.min(page_count - 1);
-    let end = end_page_id.min(page_count - 1);
-    if start > end {
-        return Ok(RenderedPageWindow {
-            pages: Vec::new(),
-            next_page_id: end.saturating_add(1),
-        });
-    }
-    let window_end = end.min(start + processing_window_size - 1);
+    };
     let mut images = Vec::new();
     for page_index in start..=window_end {
         let page = document
@@ -789,8 +899,30 @@ fn render_pdf_page_window(
     }
     Ok(RenderedPageWindow {
         pages: images,
-        next_page_id: window_end.saturating_add(1),
+        next_page_id,
     })
+}
+
+/// Calculate the inclusive PDF page range for one render window.
+///
+/// Inputs:
+/// - `page_count`: actual PDF page count.
+/// - `start_page_id`: zero-based requested start page.
+/// - `end_page_id`: zero-based requested end page.
+/// - `processing_window_size`: maximum pages to render in this window.
+fn pdf_page_window_bounds(
+    page_count: usize,
+    start_page_id: usize,
+    end_page_id: usize,
+    processing_window_size: usize,
+) -> Option<(usize, usize, usize)> {
+    if page_count == 0 || start_page_id > end_page_id || start_page_id >= page_count {
+        return None;
+    }
+    let start = start_page_id;
+    let end = end_page_id.min(page_count - 1);
+    let window_end = end.min(start.saturating_add(processing_window_size.max(1) - 1));
+    Some((start, window_end, window_end.saturating_add(1)))
 }
 
 fn bind_pdfium() -> ApiResult<Pdfium> {
@@ -801,13 +933,62 @@ fn bind_pdfium() -> ApiResult<Pdfium> {
     })
 }
 
+/// Prepare one layout image as PNG on the CPU thread pool.
+///
+/// Inputs:
+/// - `pool`: image preprocess pool used by all CPU-heavy image work.
+/// - `image`: rendered page image to resize for layout detection.
+async fn prepare_layout_image_png_async(
+    pool: Arc<rayon::ThreadPool>,
+    image: DynamicImage,
+) -> ApiResult<PreparedLayoutImage> {
+    tokio::task::spawn_blocking(move || {
+        pool.install(|| {
+            let started_at = Instant::now();
+            let image_png = encode_png(&prepare_layout_image(&image)?)?;
+            Ok(PreparedLayoutImage {
+                image_png,
+                prepare_ms: started_at.elapsed().as_millis(),
+            })
+        })
+    })
+    .await
+    .map_err(|error| ApiError::Internal(error.to_string()))?
+}
+
 fn prepare_layout_image(image: &DynamicImage) -> ApiResult<DynamicImage> {
-    let resized = image.resize_exact(
-        LAYOUT_IMAGE_SIZE,
-        LAYOUT_IMAGE_SIZE,
-        imageops::FilterType::CatmullRom,
-    );
-    Ok(resized)
+    resize_layout_image_fast(image).or_else(|error| {
+        tracing::trace!(
+            error = %error.detail(),
+            "fast layout resize failed; falling back to image crate"
+        );
+        Ok(image.resize_exact(
+            LAYOUT_IMAGE_SIZE,
+            LAYOUT_IMAGE_SIZE,
+            imageops::FilterType::CatmullRom,
+        ))
+    })
+}
+
+fn resize_layout_image_fast(image: &DynamicImage) -> ApiResult<DynamicImage> {
+    let source = image.to_rgba8();
+    let src = FastImage::from_vec_u8(
+        source.width(),
+        source.height(),
+        source.into_raw(),
+        PixelType::U8x4,
+    )
+    .map_err(|error| ApiError::Internal(error.to_string()))?;
+    let mut dst = FastImage::new(LAYOUT_IMAGE_SIZE, LAYOUT_IMAGE_SIZE, PixelType::U8x4);
+    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::CatmullRom));
+    Resizer::new()
+        .resize(&src, &mut dst, Some(&options))
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    let buffer = image::RgbaImage::from_raw(LAYOUT_IMAGE_SIZE, LAYOUT_IMAGE_SIZE, dst.into_vec())
+        .ok_or_else(|| {
+        ApiError::Internal("Failed to build resized layout image".to_string())
+    })?;
+    Ok(DynamicImage::ImageRgba8(buffer))
 }
 
 fn crop_block_image(image: &DynamicImage, block: &ContentBlock) -> ApiResult<DynamicImage> {
@@ -953,7 +1134,6 @@ fn skip_extract_types(image_analysis: bool) -> HashSet<&'static str> {
 #[cfg(test)]
 mod tests {
     use std::{
-        env,
         sync::{
             atomic::{AtomicUsize, Ordering},
             Arc,
@@ -971,10 +1151,9 @@ mod tests {
 
     use crate::domain::models::{ParseOptions, ParseTask, StoredUpload, TaskStatus};
     use crate::vlm::client::VlmHttpClient;
+    use crate::vlm::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     use super::{bind_pdfium, parse_layout_output, VlmDocumentParser};
-
-    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[derive(Clone)]
     struct TestVlmState {
@@ -983,35 +1162,6 @@ mod tests {
         active_layouts: Arc<AtomicUsize>,
         max_active_layouts: Arc<AtomicUsize>,
         fail_chat: bool,
-    }
-
-    struct EnvVarGuard {
-        name: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(name: &'static str, value: &str) -> Self {
-            let previous = env::var(name).ok();
-            env::set_var(name, value);
-            Self { name, previous }
-        }
-
-        fn unset(name: &'static str) -> Self {
-            let previous = env::var(name).ok();
-            env::remove_var(name);
-            Self { name, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.previous {
-                env::set_var(self.name, value);
-            } else {
-                env::remove_var(self.name);
-            }
-        }
     }
 
     #[test]
@@ -1037,6 +1187,79 @@ mod tests {
         assert!(blocks.is_empty());
     }
 
+    #[test]
+    fn prepares_layout_image_with_expected_dimensions() {
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(64, 32, Rgb([12_u8, 34, 56])));
+
+        let prepared = super::prepare_layout_image(&image).expect("layout image prepares");
+        let encoded = super::encode_png(&prepared).expect("layout image encodes");
+
+        assert_eq!(prepared.width(), super::LAYOUT_IMAGE_SIZE);
+        assert_eq!(prepared.height(), super::LAYOUT_IMAGE_SIZE);
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn pdf_page_window_bounds_stop_after_last_page() {
+        assert_eq!(
+            super::pdf_page_window_bounds(11, 0, 99999, 64),
+            Some((0, 10, 11))
+        );
+        assert_eq!(super::pdf_page_window_bounds(11, 11, 99999, 64), None);
+        assert_eq!(super::pdf_page_window_bounds(11, 12, 99999, 64), None);
+    }
+
+    #[tokio::test]
+    async fn prepares_window_extract_jobs_with_stable_order() {
+        let pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .expect("pool builds"),
+        );
+        let layouts = vec![super::PageLayoutResult {
+            page_index: 2,
+            page_width: 20,
+            page_height: 20,
+            point_width: 20,
+            point_height: 20,
+            page_image: DynamicImage::ImageRgb8(ImageBuffer::from_pixel(
+                20,
+                20,
+                Rgb([255_u8, 255, 255]),
+            )),
+            blocks: vec![
+                super::ContentBlock {
+                    block_type: "text".to_string(),
+                    bbox: [0.0, 0.0, 0.5, 0.5],
+                    angle: None,
+                    content: None,
+                    merge_prev: None,
+                },
+                super::ContentBlock {
+                    block_type: "image".to_string(),
+                    bbox: [0.5, 0.5, 1.0, 1.0],
+                    angle: None,
+                    content: None,
+                    merge_prev: None,
+                },
+            ],
+        }];
+
+        let jobs = super::prepare_window_extract_jobs_async(pool, true, &layouts)
+            .await
+            .expect("jobs prepare");
+
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(
+            jobs.iter()
+                .map(|job| (job.page_index, job.block_index, job.block_type.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, 0, "text"), (2, 1, "image")]
+        );
+        assert!(jobs.iter().all(|job| !job.image_png.is_empty()));
+    }
+
     #[tokio::test]
     async fn parser_uses_window_layout_then_block_extraction_with_ordered_output() {
         let _env_lock = TEST_ENV_LOCK.lock().await;
@@ -1050,7 +1273,7 @@ mod tests {
             .save_with_format(&upload_path, ImageFormat::Png)
             .expect("png fixture");
         let task = completed_test_task(temp.path().to_path_buf(), upload_path);
-        let parser = VlmDocumentParser::new(Arc::new(VlmHttpClient::new()), 4, 4);
+        let parser = VlmDocumentParser::new(Arc::new(VlmHttpClient::new()), 4, 4, 2);
 
         let file_names = parser.parse_task(&task).await.expect("parse succeeds");
 
@@ -1084,14 +1307,24 @@ mod tests {
             }],
             temp.path().to_path_buf(),
         );
-        let parser = VlmDocumentParser::new(Arc::new(VlmHttpClient::new()), 2, 2);
+        let client = Arc::new(VlmHttpClient::new());
+        let session = client
+            .session_for_request(task.server_url.as_deref())
+            .await
+            .expect("session should resolve");
+        let parser = VlmDocumentParser::new(client, 2, 2, 2);
         let pages = vec![
             rendered_test_page(1, [255, 0, 0]),
             rendered_test_page(0, [0, 255, 0]),
         ];
 
         let results = parser
-            .parse_page_window(&task, pages, Arc::new(tokio::sync::Semaphore::new(2)))
+            .parse_page_window(
+                &task,
+                &session,
+                pages,
+                Arc::new(tokio::sync::Semaphore::new(2)),
+            )
             .await
             .expect("window parse succeeds");
 
@@ -1124,7 +1357,7 @@ mod tests {
             .save_with_format(&upload_path, ImageFormat::Png)
             .expect("png fixture");
         let task = completed_test_task(temp.path().to_path_buf(), upload_path);
-        let parser = VlmDocumentParser::new(Arc::new(VlmHttpClient::new()), 4, 4);
+        let parser = VlmDocumentParser::new(Arc::new(VlmHttpClient::new()), 4, 4, 2);
 
         let error = parser.parse_task(&task).await.expect_err("parse fails");
 
@@ -1200,7 +1433,7 @@ mod tests {
         if prompt.contains("Layout Detection") {
             let active = state.active_layouts.fetch_add(1, Ordering::SeqCst) + 1;
             state.max_active_layouts.fetch_max(active, Ordering::SeqCst);
-            sleep(Duration::from_millis(20)).await;
+            sleep(Duration::from_millis(100)).await;
             state.active_layouts.fetch_sub(1, Ordering::SeqCst);
             return Ok(Json(chat_payload(
                 "<|box_start|>0 0 1000 1000<|box_end|><|ref_start|>text<|ref_end|>",
