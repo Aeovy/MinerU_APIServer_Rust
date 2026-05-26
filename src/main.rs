@@ -21,17 +21,32 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState::new(args.clone())
         .await
         .context("failed to initialize MinerU Rust API state")?;
+    let config = state.config().clone();
     let app = server::routes::build_router(state);
     let bind_addr = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("failed to bind {}", bind_addr))?;
+    let local_addr = listener
+        .local_addr()
+        .context("failed to read listener address")?;
 
-    println!(
-        "Start MinerU FastAPI Service: http://{}:{}",
-        args.host, args.port
+    let base_url = format!("http://{}:{}", args.host, args.port);
+    tracing::info!(
+        bind_addr = %bind_addr,
+        local_addr = %local_addr,
+        output_root = %config.output_root.display(),
+        max_concurrent_requests = config.max_concurrent_requests,
+        processing_window_size = config.processing_window_size,
+        vlm_max_concurrency = config.vlm_max_concurrency,
+        public_bind_exposed = config.public_bind_exposed,
+        allow_public_http_client = config.allow_public_http_client,
+        "MinerU API server started"
     );
-    println!("API documentation: http://{}:{}/docs", args.host, args.port);
+    tracing::info!(url = %base_url, "Start MinerU FastAPI Service");
+    tracing::info!(url = %format!("{base_url}/docs"), "API documentation");
+    tracing::info!(url = %format!("{base_url}/openapi.json"), "OpenAPI schema");
+    tracing::info!(url = %format!("{base_url}/health"), "Health check");
 
     axum::serve(listener, app)
         .await
