@@ -1,4 +1,9 @@
-use std::{collections::HashMap, env, sync::OnceLock, time::Duration};
+use std::{
+    collections::HashMap,
+    env,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 
 use async_openai::{config::Config, Client};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -123,15 +128,31 @@ impl VlmHttpClient {
     /// Inputs:
     /// - `request`: prompt, optional image, sampling params, and server URL.
     pub async fn predict(&self, request: VlmRequest) -> ApiResult<String> {
+        let started_at = Instant::now();
         let base_url = resolve_server_url(request.server_url.as_deref())?;
+        let prompt_kind = prompt_kind(&request.prompt);
+        let image_bytes = request.image_png.as_ref().map(Vec::len).unwrap_or_default();
         let model_name = self.resolve_model_name_cached(&base_url).await?;
         let body = build_chat_body(&model_name, &request);
+        let request_started_at = Instant::now();
         let data: Value = self
             .openai_client(&base_url)
             .chat()
             .create_byot(body)
             .await?;
-        parse_chat_content(&data)
+        let request_elapsed_ms = request_started_at.elapsed().as_millis();
+        let content = parse_chat_content(&data)?;
+        tracing::debug!(
+            base_url = %base_url,
+            model_name = %model_name,
+            prompt_kind,
+            image_bytes,
+            content_chars = content.chars().count(),
+            request_ms = request_elapsed_ms,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "vlm chat completion succeeded"
+        );
+        Ok(content)
     }
 
     /// Resolve and cache the model name for one OpenAI-compatible VLM server.
@@ -141,10 +162,22 @@ impl VlmHttpClient {
     async fn resolve_model_name_cached(&self, base_url: &str) -> ApiResult<String> {
         let mut cache = self.model_name_cache.lock().await;
         if let Some(model_name) = cache.get(base_url).cloned() {
+            tracing::debug!(
+                base_url,
+                model_name = %model_name,
+                "vlm model name resolved from cache"
+            );
             return Ok(model_name);
         }
 
+        let started_at = Instant::now();
         let model_name = self.resolve_model_name(base_url).await?;
+        tracing::debug!(
+            base_url,
+            model_name = %model_name,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "vlm model name resolved"
+        );
         Ok(cache
             .entry(base_url.to_string())
             .or_insert(model_name)
@@ -190,7 +223,14 @@ impl VlmHttpClient {
     }
 
     async fn list_models(&self, base_url: &str) -> ApiResult<Value> {
-        Ok(self.openai_client(base_url).models().list_byot().await?)
+        let started_at = Instant::now();
+        let payload = self.openai_client(base_url).models().list_byot().await?;
+        tracing::debug!(
+            base_url,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "vlm models listed"
+        );
+        Ok(payload)
     }
 
     fn openai_client(&self, base_url: &str) -> Client<MineruOpenAiConfig> {
@@ -224,6 +264,20 @@ pub fn prompt_for_block(block_type: &str) -> &'static str {
 
 pub fn layout_prompt() -> &'static str {
     "\nLayout Detection:"
+}
+
+fn prompt_kind(prompt: &str) -> &'static str {
+    if prompt.contains("Layout Detection") {
+        "layout"
+    } else if prompt.contains("Table Recognition") {
+        "table"
+    } else if prompt.contains("Formula Recognition") {
+        "formula"
+    } else if prompt.contains("Image Analysis") {
+        "image"
+    } else {
+        "text"
+    }
 }
 
 pub fn parse_chat_content(data: &Value) -> ApiResult<String> {

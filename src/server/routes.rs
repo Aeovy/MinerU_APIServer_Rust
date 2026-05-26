@@ -6,6 +6,7 @@ use axum::{
     Json, Router,
 };
 use serde_json::{json, Value};
+use std::time::Instant;
 use tower_http::{
     compression::{
         predicate::{DefaultPredicate, NotForContentType, Predicate},
@@ -14,6 +15,7 @@ use tower_http::{
     cors::CorsLayer,
     trace::{DefaultMakeSpan, DefaultOnFailure, DefaultOnRequest, DefaultOnResponse, TraceLayer},
 };
+
 use tracing::Level;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -66,14 +68,35 @@ pub(crate) async fn file_parse(
     headers: HeaderMap,
     multipart: Multipart,
 ) -> ApiResult<Response> {
+    let started_at = Instant::now();
     let base_url = base_url_from_headers(&headers);
     let task = create_async_parse_task(&state, multipart).await?;
     let task_manager = state.task_manager();
     let task_id = task.task_id;
+    tracing::debug!(
+        %task_id,
+        file_count = task.file_names.len(),
+        response_format_zip = task.response_format_zip,
+        return_md = task.return_md,
+        return_middle_json = task.return_middle_json,
+        return_model_output = task.return_model_output,
+        return_content_list = task.return_content_list,
+        return_images = task.return_images,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "file_parse task created"
+    );
     spawn_task_processor(state.clone(), task);
+    let wait_started_at = Instant::now();
     let completed = task_manager.wait_terminal(task_id).await.ok_or_else(|| {
         ApiError::ServiceUnavailable("Task was removed before completion".to_string())
     })?;
+    tracing::debug!(
+        %task_id,
+        status = completed.status.as_str(),
+        wait_ms = wait_started_at.elapsed().as_millis(),
+        total_ms = started_at.elapsed().as_millis(),
+        "file_parse task reached terminal status"
+    );
     if completed.status == TaskStatus::Failed {
         let status_payload = task_manager.status_payload(&completed, &base_url).await;
         return Ok((
@@ -85,14 +108,23 @@ pub(crate) async fn file_parse(
 
     let status_payload = task_manager.status_payload(&completed, &base_url).await;
     if !completed.response_format_zip {
+        let response_started_at = Instant::now();
         let mut payload = serde_json::to_value(&status_payload)?;
         merge_object_fields(
             &mut payload,
             ResultBuilder::build_json_payload(&completed).await?,
         );
+        tracing::debug!(
+            %task_id,
+            response_format = "json",
+            elapsed_ms = response_started_at.elapsed().as_millis(),
+            total_ms = started_at.elapsed().as_millis(),
+            "file_parse response built"
+        );
         return Ok((StatusCode::OK, Json(payload)).into_response());
     }
 
+    let response_started_at = Instant::now();
     let mut response =
         ResultBuilder::build_response(&completed, StatusCode::OK, &format!("{task_id}.zip"))
             .await?;
@@ -121,6 +153,13 @@ pub(crate) async fn file_parse(
             .result_url
             .parse()
             .expect("result url header is valid"),
+    );
+    tracing::debug!(
+        %task_id,
+        response_format = "zip",
+        elapsed_ms = response_started_at.elapsed().as_millis(),
+        total_ms = started_at.elapsed().as_millis(),
+        "file_parse response built"
     );
     Ok(response)
 }
@@ -230,11 +269,14 @@ pub(crate) async fn health(State(state): State<AppState>) -> ApiResult<Json<Heal
 }
 
 async fn create_async_parse_task(state: &AppState, multipart: Multipart) -> ApiResult<ParseTask> {
+    let started_at = Instant::now();
     let task_id = Uuid::new_v4();
     let task_output_dir = state.create_task_output_dir(task_id);
     let uploads_dir = task_output_dir.join("uploads");
     tokio::fs::create_dir_all(&uploads_dir).await?;
+    let multipart_started_at = Instant::now();
     let (options, mut uploads) = parse_multipart(multipart, UploadStore::new(uploads_dir)).await?;
+    let multipart_elapsed_ms = multipart_started_at.elapsed().as_millis();
     validate_public_http_client_policy(
         state.config().public_bind_exposed,
         state.config().allow_public_http_client,
@@ -245,8 +287,20 @@ async fn create_async_parse_task(state: &AppState, multipart: Multipart) -> ApiR
         return Err(ApiError::BadRequest("Field required: files".to_string()));
     }
     uniquify_upload_stems(&mut uploads);
+    let upload_count = uploads.len();
     let task = ParseTask::new(task_id, &options, uploads, task_output_dir);
-    Ok(state.task_manager().submit(task).await)
+    let submitted = state.task_manager().submit(task).await;
+    tracing::debug!(
+        %task_id,
+        upload_count,
+        backend = %submitted.backend,
+        start_page_id = submitted.start_page_id,
+        end_page_id = submitted.end_page_id,
+        multipart_ms = multipart_elapsed_ms,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "parse task accepted"
+    );
+    Ok(submitted)
 }
 
 async fn parse_multipart(
@@ -318,6 +372,7 @@ fn parse_usize(value: &str, name: &str) -> ApiResult<usize> {
 fn spawn_task_processor(state: AppState, task: ParseTask) {
     tokio::spawn(async move {
         let task_id = task.task_id;
+        let queue_started_at = Instant::now();
         let permit = match state.request_semaphore().acquire_owned().await {
             Ok(permit) => permit,
             Err(error) => {
@@ -328,17 +383,36 @@ fn spawn_task_processor(state: AppState, task: ParseTask) {
                 return;
             }
         };
+        tracing::debug!(
+            %task_id,
+            queue_wait_ms = queue_started_at.elapsed().as_millis(),
+            "parse task acquired request permit"
+        );
         state.task_manager().set_processing(task_id).await;
+        let parse_started_at = Instant::now();
         let result = state.parser().parse_task(&task).await;
+        let parse_elapsed_ms = parse_started_at.elapsed().as_millis();
         drop(permit);
         match result {
             Ok(file_names) => {
+                tracing::debug!(
+                    %task_id,
+                    file_count = file_names.len(),
+                    parse_ms = parse_elapsed_ms,
+                    "parse task completed"
+                );
                 state
                     .task_manager()
                     .set_completed(task_id, file_names)
                     .await
             }
             Err(error) => {
+                tracing::debug!(
+                    %task_id,
+                    parse_ms = parse_elapsed_ms,
+                    error = %error.detail(),
+                    "parse task failed"
+                );
                 state
                     .task_manager()
                     .set_failed(task_id, error.detail())

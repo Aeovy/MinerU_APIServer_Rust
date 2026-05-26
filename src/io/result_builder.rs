@@ -1,6 +1,7 @@
 use std::{
     io::{self, Cursor, Write},
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 use axum::{
@@ -44,6 +45,7 @@ impl ResultBuilder {
         status_code: StatusCode,
         zip_filename: &str,
     ) -> ApiResult<Response<Body>> {
+        let started_at = Instant::now();
         if task.response_format_zip {
             let response = Response::builder()
                 .status(status_code)
@@ -54,10 +56,23 @@ impl ResultBuilder {
                 )
                 .body(build_zip_stream(task))
                 .map_err(|error| ApiError::Internal(error.to_string()))?;
+            tracing::debug!(
+                task_id = %task.task_id,
+                file_count = task.file_names.len(),
+                zip_filename,
+                elapsed_ms = started_at.elapsed().as_millis(),
+                "zip response stream prepared"
+            );
             return Ok(response);
         }
 
         let payload = Self::build_json_payload(task).await?;
+        tracing::debug!(
+            task_id = %task.task_id,
+            file_count = task.file_names.len(),
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "json response built"
+        );
         Ok((status_code, Json(payload)).into_response())
     }
 
@@ -66,7 +81,14 @@ impl ResultBuilder {
     /// Inputs:
     /// - `task`: completed task metadata and return flags.
     pub async fn build_json_payload(task: &ParseTask) -> ApiResult<Value> {
+        let started_at = Instant::now();
         let results = build_result_dict(task).await?;
+        tracing::debug!(
+            task_id = %task.task_id,
+            file_count = task.file_names.len(),
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "json payload built"
+        );
         Ok(json!({
             "backend": task.backend,
             "version": MINERU_VERSION,
@@ -76,8 +98,10 @@ impl ResultBuilder {
 }
 
 async fn build_result_dict(task: &ParseTask) -> ApiResult<Value> {
+    let started_at = Instant::now();
     let mut results = Map::new();
     for file_name in &task.file_names {
+        let file_started_at = Instant::now();
         let parse_dir = task.output_dir.join(file_name).join("vlm");
         let mut data = Map::new();
         if task.return_md {
@@ -111,7 +135,24 @@ async fn build_result_dict(task: &ParseTask) -> ApiResult<Value> {
             );
         }
         results.insert(file_name.clone(), Value::Object(data));
+        tracing::debug!(
+            task_id = %task.task_id,
+            file_name,
+            return_md = task.return_md,
+            return_middle_json = task.return_middle_json,
+            return_model_output = task.return_model_output,
+            return_content_list = task.return_content_list,
+            return_images = task.return_images,
+            elapsed_ms = file_started_at.elapsed().as_millis(),
+            "json result file loaded"
+        );
     }
+    tracing::debug!(
+        task_id = %task.task_id,
+        file_count = task.file_names.len(),
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "json result dictionary built"
+    );
     Ok(Value::Object(results))
 }
 
@@ -119,7 +160,15 @@ fn build_zip_stream(task: &ParseTask) -> Body {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(ZIP_STREAM_CHANNEL_CAPACITY);
     let task = task.clone();
     tokio::task::spawn_blocking(move || {
+        let started_at = Instant::now();
         let result = build_zip_to_writer(&task, ChannelZipWriter::new(sender.clone()));
+        tracing::debug!(
+            task_id = %task.task_id,
+            file_count = task.file_names.len(),
+            elapsed_ms = started_at.elapsed().as_millis(),
+            ok = result.is_ok(),
+            "zip stream build finished"
+        );
         if let Err(error) = result {
             let _ = sender.blocking_send(Err(io::Error::other(error.detail())));
         }
@@ -142,8 +191,10 @@ async fn build_zip(task: &ParseTask) -> ApiResult<Vec<u8>> {
 }
 
 fn build_zip_to_writer<W: Write>(task: &ParseTask, writer: W) -> ApiResult<W> {
+    let started_at = Instant::now();
     let mut writer = StreamingZipWriter::new(writer);
     for (file_index, file_name) in task.file_names.iter().enumerate() {
+        let file_started_at = Instant::now();
         let parse_dir = task.output_dir.join(file_name).join("vlm");
         add_if_requested(
             &mut writer,
@@ -201,9 +252,27 @@ fn build_zip_to_writer<W: Write>(task: &ParseTask, writer: W) -> ApiResult<W> {
         if task.return_original_file {
             add_original_file(&mut writer, task, file_index, file_name)?;
         }
+        tracing::debug!(
+            task_id = %task.task_id,
+            file_name,
+            return_md = task.return_md,
+            return_middle_json = task.return_middle_json,
+            return_model_output = task.return_model_output,
+            return_content_list = task.return_content_list,
+            return_images = task.return_images,
+            return_original_file = task.return_original_file,
+            elapsed_ms = file_started_at.elapsed().as_millis(),
+            "zip file entries added"
+        );
     }
     let mut writer = writer.finish()?;
     writer.flush().map_err(ApiError::from)?;
+    tracing::debug!(
+        task_id = %task.task_id,
+        file_count = task.file_names.len(),
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "zip writer finished"
+    );
     Ok(writer)
 }
 

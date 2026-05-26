@@ -2,3 +2,4 @@
 /output
 /temp
 .DS_Store
+.env
