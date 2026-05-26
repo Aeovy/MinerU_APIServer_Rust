@@ -24,7 +24,7 @@ use super::client::{
     layout_prompt, layout_sampling_params, prompt_for_block, sampling_params_for_block,
     VlmHttpClient, VlmRequest, VlmSession,
 };
-use super::python_compat::{PythonDocumentBuilder, PythonPageInput};
+use super::python_compat::{DocumentOutputAccumulator, PythonPageInput};
 
 const DEFAULT_PDF_IMAGE_DPI: f32 = 200.0;
 const LAYOUT_IMAGE_SIZE: u32 = 1036;
@@ -192,7 +192,7 @@ impl VlmDocumentParser {
             "vlm session resolved"
         );
         let pending_image_dir = task.output_dir.join("_pending_images");
-        let mut output_builder = PythonDocumentBuilder::new();
+        let mut output_builder = DocumentOutputAccumulator::new();
         let mut page_count = 0_usize;
         tracing::debug!(
             task_id = %task.task_id,

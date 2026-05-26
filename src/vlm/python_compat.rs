@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     io::Cursor,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use image::{DynamicImage, ImageFormat};
@@ -15,14 +16,14 @@ use crate::{
     error::{ApiError, ApiResult},
 };
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PythonPageInput {
     pub page_index: usize,
     pub page_width: u32,
     pub page_height: u32,
     pub point_width: u32,
     pub point_height: u32,
-    pub image: DynamicImage,
+    pub image: Arc<DynamicImage>,
     pub blocks: Vec<ContentBlock>,
 }
 
@@ -34,6 +35,67 @@ pub struct PythonDocumentOutput {
     pub content_list: Value,
     pub content_list_v2: Value,
     pub image_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Default)]
+pub struct DocumentOutputAccumulator {
+    pdf_info: Vec<PageInfo>,
+    model_output_pages: Vec<Value>,
+    image_files: Vec<PathBuf>,
+}
+
+impl DocumentOutputAccumulator {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Consume one processing window and append its lightweight Python-compatible output state.
+    ///
+    /// Inputs:
+    /// - `pages`: parsed page images and raw VLM blocks for one processing window.
+    /// - `pending_image_dir`: temporary directory for Python-style cropped JPEG assets.
+    pub async fn append_pages(
+        &mut self,
+        pages: Vec<PythonPageInput>,
+        pending_image_dir: &Path,
+    ) -> ApiResult<()> {
+        fs::create_dir_all(pending_image_dir).await?;
+
+        for mut page in pages {
+            let processed_blocks = post_process_raw_blocks(std::mem::take(&mut page.blocks));
+            self.model_output_pages.push(Value::Array(
+                processed_blocks.iter().map(model_block_to_json).collect(),
+            ));
+
+            let (mut page_info, mut page_image_files) =
+                build_page_info(&page, &processed_blocks, pending_image_dir).await?;
+            finalize_page_info(&mut page_info);
+            self.pdf_info.push(page_info);
+            self.image_files.append(&mut page_image_files);
+        }
+
+        Ok(())
+    }
+
+    /// Finalize accumulated page state into the existing MinerU-compatible document output.
+    pub fn finish(self) -> PythonDocumentOutput {
+        let markdown = make_markdown(&self.pdf_info);
+        let content_list = make_content_list(&self.pdf_info);
+        let content_list_v2 = make_content_list_v2(&self.pdf_info);
+
+        PythonDocumentOutput {
+            markdown,
+            middle_json: json!({
+                "pdf_info": self.pdf_info.iter().map(page_info_to_json).collect::<Vec<Value>>(),
+                "_backend": "vlm",
+                "_version_name": crate::config::MINERU_VERSION,
+            }),
+            model_output: Value::Array(self.model_output_pages),
+            content_list,
+            content_list_v2,
+            image_files: self.image_files,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -74,41 +136,11 @@ pub async fn build_document_output(
     pages: &[PythonPageInput],
     pending_image_dir: &Path,
 ) -> ApiResult<PythonDocumentOutput> {
-    fs::create_dir_all(pending_image_dir).await?;
-
-    let mut pdf_info = Vec::new();
-    let mut model_output_pages = Vec::new();
-    let mut image_files = Vec::new();
-
-    for page in pages {
-        let processed_blocks = post_process_raw_blocks(page.blocks.clone());
-        model_output_pages.push(Value::Array(
-            processed_blocks.iter().map(model_block_to_json).collect(),
-        ));
-
-        let (mut page_info, mut page_image_files) =
-            build_page_info(page, &processed_blocks, pending_image_dir).await?;
-        finalize_page_info(&mut page_info);
-        pdf_info.push(page_info);
-        image_files.append(&mut page_image_files);
-    }
-
-    let markdown = make_markdown(&pdf_info);
-    let content_list = make_content_list(&pdf_info);
-    let content_list_v2 = make_content_list_v2(&pdf_info);
-
-    Ok(PythonDocumentOutput {
-        markdown,
-        middle_json: json!({
-            "pdf_info": pdf_info.iter().map(page_info_to_json).collect::<Vec<Value>>(),
-            "_backend": "vlm",
-            "_version_name": crate::config::MINERU_VERSION,
-        }),
-        model_output: Value::Array(model_output_pages),
-        content_list,
-        content_list_v2,
-        image_files,
-    })
+    let mut builder = DocumentOutputAccumulator::new();
+    builder
+        .append_pages(pages.to_vec(), pending_image_dir)
+        .await?;
+    Ok(builder.finish())
 }
 
 #[derive(Debug, Clone)]
@@ -1631,7 +1663,7 @@ mod tests {
                     page_height: 2200,
                     point_width: 612,
                     point_height: 792,
-                    image: DynamicImage::ImageRgb8(RgbImage::new(1700, 2200)),
+                    image: Arc::new(DynamicImage::ImageRgb8(RgbImage::new(1700, 2200))),
                     blocks,
                 }
             })

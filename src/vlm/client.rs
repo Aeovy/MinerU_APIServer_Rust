@@ -152,7 +152,7 @@ impl VlmHttpClient {
         let started_at = Instant::now();
         let prompt_kind = prompt_kind(&request.prompt);
         let image_bytes = request.image_png.as_ref().map(Vec::len).unwrap_or_default();
-        let body = build_chat_body(&session.model_name, &request);
+        let body = build_chat_body(&session.model_name, request);
         let mut attempt_count = 0_usize;
         let (data, request_elapsed_ms) = loop {
             let attempt = attempt_count + 1;
@@ -437,10 +437,16 @@ pub fn parse_chat_content(data: &Value) -> ApiResult<String> {
         .to_string())
 }
 
-fn build_chat_body(model_name: &str, request: &VlmRequest) -> Value {
+fn build_chat_body(model_name: &str, request: VlmRequest) -> Value {
+    let VlmRequest {
+        prompt,
+        image_png,
+        sampling_params,
+        priority,
+    } = request;
     let model_is_gpt = model_name.to_ascii_lowercase().starts_with("gpt");
     let mut user_content = Vec::new();
-    if let Some(image_png) = &request.image_png {
+    if let Some(image_png) = image_png {
         user_content.push(json!({
             "type": "image_url",
             "image_url": { "url": format!("data:image/png;base64,{}", STANDARD.encode(image_png)) }
@@ -448,7 +454,7 @@ fn build_chat_body(model_name: &str, request: &VlmRequest) -> Value {
     }
     user_content.push(json!({
         "type": "text",
-        "text": if request.prompt.is_empty() { DEFAULT_USER_PROMPT } else { &request.prompt }
+        "text": if prompt.is_empty() { DEFAULT_USER_PROMPT } else { &prompt }
     }));
 
     let mut body = json!({
@@ -459,8 +465,8 @@ fn build_chat_body(model_name: &str, request: &VlmRequest) -> Value {
         ]
     });
     let object = body.as_object_mut().expect("body is an object");
-    insert_sampling_params(object, &request.sampling_params, model_is_gpt);
-    if let Some(priority) = request.priority {
+    insert_sampling_params(object, &sampling_params, model_is_gpt);
+    if let Some(priority) = priority {
         object.insert("priority".to_string(), json!(priority));
     }
     body
@@ -581,7 +587,8 @@ mod tests {
     use crate::vlm::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     use super::{
-        parse_chat_content, sampling_params_for_block, VlmHttpClient, VlmRequest, VlmSession,
+        build_chat_body, parse_chat_content, sampling_params_for_block, VlmHttpClient, VlmRequest,
+        VlmSession,
     };
 
     async fn spawn_models_server(
@@ -679,6 +686,29 @@ mod tests {
     fn rejects_empty_choices() {
         let payload = json!({ "choices": [] });
         assert!(parse_chat_content(&payload).is_err());
+    }
+
+    #[test]
+    fn chat_body_consumes_image_bytes_into_base64_url() {
+        let body = build_chat_body(
+            "test-model",
+            VlmRequest {
+                prompt: "\nText Recognition:".to_string(),
+                image_png: Some(vec![1_u8, 2, 3]),
+                sampling_params: sampling_params_for_block("text"),
+                priority: Some(7),
+            },
+        );
+
+        assert_eq!(body["priority"], 7);
+        assert_eq!(
+            body["messages"][1]["content"][0]["image_url"]["url"],
+            "data:image/png;base64,AQID"
+        );
+        assert_eq!(
+            body["messages"][1]["content"][1]["text"],
+            "\nText Recognition:"
+        );
     }
 
     #[tokio::test]
