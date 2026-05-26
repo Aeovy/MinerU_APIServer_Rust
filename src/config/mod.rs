@@ -1,4 +1,4 @@
-use std::{env, net::IpAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{env, net::IpAddr, path::PathBuf, str::FromStr, thread, time::Duration};
 
 use clap::Parser;
 
@@ -118,35 +118,65 @@ pub fn is_public_bind_host(host: &str) -> bool {
 }
 
 fn read_usize_env(name: &str, default: usize, minimum: usize) -> usize {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value >= minimum)
-        .unwrap_or(default)
+    read_parsed_env(name, default, minimum)
 }
 
 fn read_u64_env(name: &str, default: u64, minimum: u64) -> u64 {
-    env::var(name)
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .filter(|value| *value >= minimum)
-        .unwrap_or(default)
+    read_parsed_env(name, default, minimum)
+}
+
+fn read_parsed_env<T>(name: &str, default: T, minimum: T) -> T
+where
+    T: Copy + Ord + FromStr + std::fmt::Display,
+{
+    let Ok(raw) = env::var(name) else {
+        return default;
+    };
+    let trimmed = raw.trim();
+    match trimmed.parse::<T>() {
+        Ok(value) if value >= minimum => value,
+        Ok(value) => {
+            tracing::warn!(
+                name,
+                value = %value,
+                minimum = %minimum,
+                default = %default,
+                "environment value below minimum; using default"
+            );
+            default
+        }
+        Err(_) => {
+            tracing::warn!(
+                name,
+                value = %trimmed,
+                default = %default,
+                "invalid environment value; using default"
+            );
+            default
+        }
+    }
 }
 
 fn default_image_preprocess_threads() -> usize {
     match DEFAULT_IMAGE_PREPROCESS_THREADS {
-        0 => num_cpus::get().max(1),
+        0 => available_parallelism(),
         value => value.max(1),
     }
 }
 
+fn available_parallelism() -> usize {
+    thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .max(1)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::env;
-
     use super::{
         is_public_bind_host, CliArgs, DEFAULT_MAX_UPLOAD_SIZE_BYTES, DEFAULT_VLM_MAX_CONCURRENCY,
     };
+    use crate::vlm::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn detects_public_bind_hosts() {
@@ -156,111 +186,93 @@ mod tests {
         assert!(!is_public_bind_host("localhost"));
     }
 
-    #[test]
-    fn reads_vlm_max_concurrency_with_default_and_minimum() {
-        let previous = env::var("MINERU_VLM_MAX_CONCURRENCY").ok();
+    #[tokio::test]
+    async fn reads_vlm_max_concurrency_with_default_and_minimum() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
         let args = CliArgs {
             host: "127.0.0.1".to_string(),
             port: 34000,
             allow_public_http_client: false,
         };
 
-        env::remove_var("MINERU_VLM_MAX_CONCURRENCY");
+        let _value = EnvVarGuard::unset("MINERU_VLM_MAX_CONCURRENCY");
         assert_eq!(
             super::ServiceConfig::from_args(&args).vlm_max_concurrency,
             DEFAULT_VLM_MAX_CONCURRENCY
         );
 
-        env::set_var("MINERU_VLM_MAX_CONCURRENCY", "0");
+        let _value = EnvVarGuard::set("MINERU_VLM_MAX_CONCURRENCY", "0");
         assert_eq!(
             super::ServiceConfig::from_args(&args).vlm_max_concurrency,
             DEFAULT_VLM_MAX_CONCURRENCY
         );
 
-        env::set_var("MINERU_VLM_MAX_CONCURRENCY", "7");
+        let _value = EnvVarGuard::set("MINERU_VLM_MAX_CONCURRENCY", " 7 ");
         assert_eq!(
             super::ServiceConfig::from_args(&args).vlm_max_concurrency,
             7
         );
-
-        if let Some(value) = previous {
-            env::set_var("MINERU_VLM_MAX_CONCURRENCY", value);
-        } else {
-            env::remove_var("MINERU_VLM_MAX_CONCURRENCY");
-        }
     }
 
-    #[test]
-    fn reads_max_upload_size_bytes_with_default_and_minimum() {
-        let previous = env::var("MINERU_API_MAX_UPLOAD_SIZE_BYTES").ok();
+    #[tokio::test]
+    async fn reads_max_upload_size_bytes_with_default_and_minimum() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
         let args = CliArgs {
             host: "127.0.0.1".to_string(),
             port: 34000,
             allow_public_http_client: false,
         };
 
-        env::remove_var("MINERU_API_MAX_UPLOAD_SIZE_BYTES");
+        let _value = EnvVarGuard::unset("MINERU_API_MAX_UPLOAD_SIZE_BYTES");
         assert_eq!(
             super::ServiceConfig::from_args(&args).max_upload_size_bytes,
             DEFAULT_MAX_UPLOAD_SIZE_BYTES
         );
 
-        env::set_var("MINERU_API_MAX_UPLOAD_SIZE_BYTES", "0");
+        let _value = EnvVarGuard::set("MINERU_API_MAX_UPLOAD_SIZE_BYTES", "0");
         assert_eq!(
             super::ServiceConfig::from_args(&args).max_upload_size_bytes,
             DEFAULT_MAX_UPLOAD_SIZE_BYTES
         );
 
-        env::set_var("MINERU_API_MAX_UPLOAD_SIZE_BYTES", "4096");
+        let _value = EnvVarGuard::set("MINERU_API_MAX_UPLOAD_SIZE_BYTES", "4096");
         assert_eq!(
             super::ServiceConfig::from_args(&args).max_upload_size_bytes,
             4096
         );
-
-        if let Some(value) = previous {
-            env::set_var("MINERU_API_MAX_UPLOAD_SIZE_BYTES", value);
-        } else {
-            env::remove_var("MINERU_API_MAX_UPLOAD_SIZE_BYTES");
-        }
     }
 
-    #[test]
-    fn reads_image_preprocess_threads_with_auto_default_and_minimum() {
-        let previous = env::var("MINERU_IMAGE_PREPROCESS_THREADS").ok();
+    #[tokio::test]
+    async fn reads_image_preprocess_threads_with_auto_default_and_minimum() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
         let args = CliArgs {
             host: "127.0.0.1".to_string(),
             port: 34000,
             allow_public_http_client: false,
         };
 
-        env::remove_var("MINERU_IMAGE_PREPROCESS_THREADS");
+        let _value = EnvVarGuard::unset("MINERU_IMAGE_PREPROCESS_THREADS");
         assert_eq!(
             super::ServiceConfig::from_args(&args).image_preprocess_threads,
-            num_cpus::get().max(1)
+            super::available_parallelism()
         );
 
-        env::set_var("MINERU_IMAGE_PREPROCESS_THREADS", "0");
+        let _value = EnvVarGuard::set("MINERU_IMAGE_PREPROCESS_THREADS", "0");
         assert_eq!(
             super::ServiceConfig::from_args(&args).image_preprocess_threads,
-            num_cpus::get().max(1)
+            super::available_parallelism()
         );
 
-        env::set_var("MINERU_IMAGE_PREPROCESS_THREADS", "5");
+        let _value = EnvVarGuard::set("MINERU_IMAGE_PREPROCESS_THREADS", "5");
         assert_eq!(
             super::ServiceConfig::from_args(&args).image_preprocess_threads,
             5
         );
 
-        env::set_var("MINERU_IMAGE_PREPROCESS_THREADS", "not-a-number");
+        let _value = EnvVarGuard::set("MINERU_IMAGE_PREPROCESS_THREADS", "\"8\"");
         assert_eq!(
             super::ServiceConfig::from_args(&args).image_preprocess_threads,
-            num_cpus::get().max(1)
+            super::available_parallelism()
         );
-
-        if let Some(value) = previous {
-            env::set_var("MINERU_IMAGE_PREPROCESS_THREADS", value);
-        } else {
-            env::remove_var("MINERU_IMAGE_PREPROCESS_THREADS");
-        }
     }
 }

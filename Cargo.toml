@@ -17,7 +17,6 @@ fast_image_resize = { version = "6.0.0", features = ["image", "rayon"] }
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
 md-5 = "0.10"
 mime_guess = "2.0"
-num_cpus = "1.17"
 pdfium-render = "0.8"
 pdfium-auto = { version = "0.3.0", features = ["bundled"] }
 printpdf = { version = "0.9.1", default-features = false, features = ["png"] }
