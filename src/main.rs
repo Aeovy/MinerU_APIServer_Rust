@@ -31,7 +31,7 @@ async fn main() -> anyhow::Result<()> {
         .local_addr()
         .context("failed to read listener address")?;
 
-    let base_url = format!("http://{}:{}", args.host, args.port);
+    let base_url = format!("http://{}:{}", args.host, local_addr.port());
     tracing::info!(
         bind_addr = %bind_addr,
         local_addr = %local_addr,
