@@ -46,11 +46,7 @@ impl UploadStore {
         }
         let destination = self.unique_destination(&filename).await;
         let mut output = fs::File::create(&destination).await?;
-        while let Some(chunk) = field
-            .chunk()
-            .await
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?
-        {
+        while let Some(chunk) = field.chunk().await.map_err(ApiError::from)? {
             output.write_all(&chunk).await?;
         }
         output.flush().await?;

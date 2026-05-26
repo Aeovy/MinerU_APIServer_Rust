@@ -5,6 +5,7 @@ use clap::Parser;
 pub const API_PROTOCOL_VERSION: u8 = 1;
 pub const MINERU_VERSION: &str = "3.1.15";
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 3;
+pub const DEFAULT_MAX_UPLOAD_SIZE_BYTES: usize = 256 * 1024 * 1024;
 pub const DEFAULT_PROCESSING_WINDOW_SIZE: usize = 64;
 pub const DEFAULT_VLM_MAX_CONCURRENCY: usize = 100;
 pub const DEFAULT_IMAGE_PREPROCESS_THREADS: usize = 0;
@@ -33,6 +34,7 @@ pub struct ServiceConfig {
     pub allow_public_http_client: bool,
     pub output_root: PathBuf,
     pub max_concurrent_requests: usize,
+    pub max_upload_size_bytes: usize,
     pub processing_window_size: usize,
     pub vlm_max_concurrency: usize,
     pub image_preprocess_threads: usize,
@@ -54,6 +56,11 @@ impl ServiceConfig {
         let max_concurrent_requests = read_usize_env(
             "MINERU_API_MAX_CONCURRENT_REQUESTS",
             default_max_concurrent_requests,
+            1,
+        );
+        let max_upload_size_bytes = read_usize_env(
+            "MINERU_API_MAX_UPLOAD_SIZE_BYTES",
+            DEFAULT_MAX_UPLOAD_SIZE_BYTES,
             1,
         );
         let processing_window_size = read_usize_env(
@@ -87,6 +94,7 @@ impl ServiceConfig {
             allow_public_http_client: args.allow_public_http_client,
             output_root,
             max_concurrent_requests,
+            max_upload_size_bytes,
             processing_window_size,
             vlm_max_concurrency,
             image_preprocess_threads,
@@ -136,7 +144,9 @@ fn default_image_preprocess_threads() -> usize {
 mod tests {
     use std::env;
 
-    use super::{is_public_bind_host, CliArgs, DEFAULT_VLM_MAX_CONCURRENCY};
+    use super::{
+        is_public_bind_host, CliArgs, DEFAULT_MAX_UPLOAD_SIZE_BYTES, DEFAULT_VLM_MAX_CONCURRENCY,
+    };
 
     #[test]
     fn detects_public_bind_hosts() {
@@ -177,6 +187,40 @@ mod tests {
             env::set_var("MINERU_VLM_MAX_CONCURRENCY", value);
         } else {
             env::remove_var("MINERU_VLM_MAX_CONCURRENCY");
+        }
+    }
+
+    #[test]
+    fn reads_max_upload_size_bytes_with_default_and_minimum() {
+        let previous = env::var("MINERU_API_MAX_UPLOAD_SIZE_BYTES").ok();
+        let args = CliArgs {
+            host: "127.0.0.1".to_string(),
+            port: 34000,
+            allow_public_http_client: false,
+        };
+
+        env::remove_var("MINERU_API_MAX_UPLOAD_SIZE_BYTES");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).max_upload_size_bytes,
+            DEFAULT_MAX_UPLOAD_SIZE_BYTES
+        );
+
+        env::set_var("MINERU_API_MAX_UPLOAD_SIZE_BYTES", "0");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).max_upload_size_bytes,
+            DEFAULT_MAX_UPLOAD_SIZE_BYTES
+        );
+
+        env::set_var("MINERU_API_MAX_UPLOAD_SIZE_BYTES", "4096");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).max_upload_size_bytes,
+            4096
+        );
+
+        if let Some(value) = previous {
+            env::set_var("MINERU_API_MAX_UPLOAD_SIZE_BYTES", value);
+        } else {
+            env::remove_var("MINERU_API_MAX_UPLOAD_SIZE_BYTES");
         }
     }
 

@@ -11,6 +11,8 @@ pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
+    PayloadTooLarge(String),
+    #[error("{0}")]
     NotFound(String),
     #[error("{0}")]
     ServiceUnavailable(String),
@@ -22,6 +24,7 @@ impl ApiError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::ServiceUnavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -44,6 +47,15 @@ impl IntoResponse for ApiError {
 impl From<std::io::Error> for ApiError {
     fn from(error: std::io::Error) -> Self {
         Self::Internal(error.to_string())
+    }
+}
+
+impl From<axum::extract::multipart::MultipartError> for ApiError {
+    fn from(error: axum::extract::multipart::MultipartError) -> Self {
+        if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            return Self::PayloadTooLarge(error.body_text());
+        }
+        Self::BadRequest(error.body_text())
     }
 }
 

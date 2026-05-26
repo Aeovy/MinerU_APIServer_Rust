@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -36,6 +36,7 @@ use crate::{
 };
 
 pub fn build_router(state: AppState) -> Router {
+    let max_upload_size_bytes = state.config().max_upload_size_bytes;
     Router::new()
         .route("/file_parse", post(file_parse))
         .route("/tasks", post(submit_task))
@@ -53,6 +54,7 @@ pub fn build_router(state: AppState) -> Router {
         .layer(CompressionLayer::new().compress_when(
             DefaultPredicate::new().and(NotForContentType::const_new("application/zip")),
         ))
+        .layer(DefaultBodyLimit::max(max_upload_size_bytes))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -261,6 +263,7 @@ pub(crate) async fn health(State(state): State<AppState>) -> ApiResult<Json<Heal
         completed_tasks: stats.completed,
         failed_tasks: stats.failed,
         max_concurrent_requests: state.config().max_concurrent_requests,
+        max_upload_size_bytes: state.config().max_upload_size_bytes,
         processing_window_size: state.config().processing_window_size,
         vlm_max_concurrency: state.config().vlm_max_concurrency,
         task_retention_seconds: state.config().task_retention.as_secs(),
@@ -309,20 +312,13 @@ async fn parse_multipart(
 ) -> ApiResult<(ParseOptions, Vec<StoredUpload>)> {
     let mut options = ParseOptions::default();
     let mut uploads = Vec::new();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?
-    {
+    while let Some(field) = multipart.next_field().await.map_err(ApiError::from)? {
         let name = field.name().unwrap_or_default().to_string();
         if name == "files" {
             uploads.push(upload_store.save_field(field).await?);
             continue;
         }
-        let text = field
-            .text()
-            .await
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        let text = field.text().await.map_err(ApiError::from)?;
         apply_form_field(&mut options, &name, &text)?;
     }
     options.return_original_file = options.return_original_file && options.response_format_zip;
