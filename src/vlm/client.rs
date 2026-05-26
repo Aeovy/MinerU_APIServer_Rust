@@ -404,36 +404,93 @@ mod tests {
     use axum::{routing::get, Json, Router};
     use futures::future::join_all;
     use serde_json::json;
-    use tokio::net::TcpListener;
+    use tokio::{net::TcpListener, sync::oneshot, time::Duration};
 
     use super::{parse_chat_content, VlmHttpClient};
+
+    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = env::var(name).ok();
+            env::set_var(name, value);
+            Self { name, previous }
+        }
+
+        fn unset(name: &'static str) -> Self {
+            let previous = env::var(name).ok();
+            env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                env::set_var(self.name, value);
+            } else {
+                env::remove_var(self.name);
+            }
+        }
+    }
 
     async fn spawn_models_server(
         counter: Arc<AtomicUsize>,
     ) -> (String, tokio::task::JoinHandle<()>) {
-        let app = Router::new().route(
-            "/v1/models",
-            get({
-                let counter = counter.clone();
-                move || {
+        let app = Router::new()
+            .route(
+                "/v1/models",
+                get({
                     let counter = counter.clone();
-                    async move {
-                        counter.fetch_add(1, Ordering::SeqCst);
-                        Json(json!({ "data": [{ "id": "cached-model" }] }))
+                    move || {
+                        let counter = counter.clone();
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            Json(json!({
+                                "object": "list",
+                                "data": [{ "id": "cached-model", "object": "model" }]
+                            }))
+                        }
                     }
-                }
-            }),
-        );
+                }),
+            )
+            .route("/ready", get(|| async { "ok" }));
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test server must bind");
         let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (ready_sender, ready_receiver) = oneshot::channel();
         let server = tokio::spawn(async move {
+            let _ = ready_sender.send(());
             axum::serve(listener, app)
                 .await
                 .expect("test server must run");
         });
+        ready_receiver.await.expect("test server must start");
+        wait_until_ready(&base_url).await;
         (base_url, server)
+    }
+
+    async fn wait_until_ready(base_url: &str) {
+        let ready_url = format!("{base_url}/ready");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("ready client should build");
+        for _ in 0..100 {
+            if let Ok(response) = client.get(&ready_url).send().await {
+                if response.status().is_success() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("test server did not become ready");
     }
 
     #[test]
@@ -452,8 +509,9 @@ mod tests {
 
     #[tokio::test]
     async fn caches_resolved_model_name_across_concurrent_requests() {
-        let previous_model_name = env::var("MINERU_VL_MODEL_NAME").ok();
-        env::remove_var("MINERU_VL_MODEL_NAME");
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let _model_name = EnvVarGuard::unset("MINERU_VL_MODEL_NAME");
+        let _no_proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1,localhost");
         let counter = Arc::new(AtomicUsize::new(0));
         let (base_url, server) = spawn_models_server(counter.clone()).await;
         let client = VlmHttpClient::new();
@@ -461,9 +519,6 @@ mod tests {
         let results = join_all((0..16).map(|_| client.resolve_model_name_cached(&base_url))).await;
 
         server.abort();
-        if let Some(value) = previous_model_name {
-            env::set_var("MINERU_VL_MODEL_NAME", value);
-        }
         for result in results {
             assert_eq!(result.unwrap(), "cached-model");
         }

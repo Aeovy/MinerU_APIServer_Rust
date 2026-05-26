@@ -44,12 +44,24 @@ struct PageParseResult {
 }
 
 struct RenderedPage {
+    page_index: usize,
     image: DynamicImage,
     point_width: u32,
     point_height: u32,
 }
 
+struct PageLayoutResult {
+    page_index: usize,
+    page_width: u32,
+    page_height: u32,
+    point_width: u32,
+    point_height: u32,
+    page_image: DynamicImage,
+    blocks: Vec<ContentBlock>,
+}
+
 struct BlockExtractJob {
+    page_index: usize,
     block_index: usize,
     block_type: String,
     image_png: Vec<u8>,
@@ -57,9 +69,15 @@ struct BlockExtractJob {
 }
 
 struct BlockExtractResult {
+    page_index: usize,
     block_index: usize,
     content: String,
     image_png: Option<Vec<u8>>,
+}
+
+struct RenderedPageWindow {
+    pages: Vec<RenderedPage>,
+    next_page_id: usize,
 }
 
 impl VlmDocumentParser {
@@ -104,35 +122,33 @@ impl VlmDocumentParser {
         task: &ParseTask,
         upload: &StoredUpload,
     ) -> ApiResult<ParsedDocument> {
-        let pages = self
-            .load_pages(upload, task.start_page_id, task.end_page_id)
-            .await?;
         let limiter = Arc::new(Semaphore::new(self.vlm_max_concurrency));
         let mut page_results = Vec::new();
-        let mut enumerated_pages = pages.into_iter().enumerate();
 
-        loop {
-            let page_window = enumerated_pages
-                .by_ref()
-                .take(self.processing_window_size.max(1))
-                .collect::<Vec<_>>();
-            if page_window.is_empty() {
-                break;
+        if upload.suffix == "pdf" {
+            let bytes = fs::read(&upload.path).await?;
+            let mut next_page_id = task.start_page_id;
+            loop {
+                let window = self
+                    .load_pdf_page_window(&bytes, next_page_id, task.end_page_id)
+                    .await?;
+                if window.pages.is_empty() {
+                    break;
+                }
+                next_page_id = window.next_page_id;
+                page_results.extend(
+                    self.parse_page_window(task, window.pages, limiter.clone())
+                        .await?,
+                );
+                if next_page_id > task.end_page_id {
+                    break;
+                }
             }
-
-            let unordered_results =
-                stream::iter(page_window.into_iter().map(|(page_index, page)| {
-                    self.parse_page(task, page_index, page, limiter.clone())
-                }))
-                .buffer_unordered(self.vlm_max_concurrency)
-                .collect::<Vec<_>>()
-                .await;
-            let mut window_results = unordered_results
-                .into_iter()
-                .collect::<ApiResult<Vec<PageParseResult>>>()?;
-            window_results.sort_by_key(|result| result.page_index);
-            page_results.extend(window_results);
+        } else {
+            let pages = self.load_image_pages(upload).await?;
+            page_results.extend(self.parse_page_window(task, pages, limiter.clone()).await?);
         }
+
         page_results.sort_by_key(|result| result.page_index);
         let python_pages = page_results
             .into_iter()
@@ -160,22 +176,95 @@ impl VlmDocumentParser {
         })
     }
 
-    /// Parse one rendered page with MinerU's two-step VLM flow.
+    /// Parse one rendered page window as layout, block preparation, and block extraction stages.
     ///
     /// Inputs:
     /// - `task`: request options and output directory.
-    /// - `page_index`: zero-based page index in the parsed document.
-    /// - `page_image`: rendered PDF page or uploaded image.
+    /// - `pages`: rendered page images in one processing window.
     /// - `limiter`: shared per-document VLM request limiter.
-    async fn parse_page(
+    async fn parse_page_window(
         &self,
         task: &ParseTask,
-        page_index: usize,
+        pages: Vec<RenderedPage>,
+        limiter: Arc<Semaphore>,
+    ) -> ApiResult<Vec<PageParseResult>> {
+        let unordered_layouts = stream::iter(
+            pages
+                .into_iter()
+                .map(|page| self.detect_page_layout(task, page, limiter.clone())),
+        )
+        .buffer_unordered(self.vlm_max_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+        let mut layouts = unordered_layouts
+            .into_iter()
+            .collect::<ApiResult<Vec<PageLayoutResult>>>()?;
+        layouts.sort_by_key(|layout| layout.page_index);
+
+        let mut jobs = Vec::new();
+        for layout in &layouts {
+            jobs.extend(prepare_block_extract_jobs(task, layout)?);
+        }
+
+        let unordered_extracts = stream::iter(jobs.into_iter().map(|job| {
+            self.extract_block(task, page_priority(job.page_index), job, limiter.clone())
+        }))
+        .buffer_unordered(self.vlm_max_concurrency)
+        .collect::<Vec<_>>()
+        .await;
+        let mut extracts = unordered_extracts
+            .into_iter()
+            .collect::<ApiResult<Vec<BlockExtractResult>>>()?;
+        extracts.sort_by_key(|result| (result.page_index, result.block_index));
+
+        for result in extracts {
+            if let Some(layout) = layouts
+                .iter_mut()
+                .find(|layout| layout.page_index == result.page_index)
+            {
+                if !result.content.is_empty() {
+                    layout.blocks[result.block_index].content = Some(result.content);
+                }
+                if let Some(image_png) = result.image_png {
+                    self.write_result_image_bytes(
+                        task,
+                        result.page_index,
+                        result.block_index,
+                        &image_png,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        Ok(layouts
+            .into_iter()
+            .map(|layout| PageParseResult {
+                page_index: layout.page_index,
+                page_width: layout.page_width,
+                page_height: layout.page_height,
+                point_width: layout.point_width,
+                point_height: layout.point_height,
+                page_image: layout.page_image,
+                blocks: layout.blocks,
+            })
+            .collect())
+    }
+
+    /// Run MinerU layout detection for one rendered page.
+    ///
+    /// Inputs:
+    /// - `task`: request options and output directory.
+    /// - `page`: rendered PDF page or uploaded image.
+    /// - `limiter`: shared per-document VLM request limiter.
+    async fn detect_page_layout(
+        &self,
+        task: &ParseTask,
         page: RenderedPage,
         limiter: Arc<Semaphore>,
-    ) -> ApiResult<PageParseResult> {
+    ) -> ApiResult<PageLayoutResult> {
+        let page_index = page.page_index;
         let page_image = page.image;
-        let priority = Some(page_index as i32);
         let layout_image = encode_png(&prepare_layout_image(&page_image)?)?;
         let layout_output = self
             .predict_with_limit(
@@ -185,15 +274,13 @@ impl VlmDocumentParser {
                     prompt: layout_prompt().to_string(),
                     image_png: Some(layout_image),
                     sampling_params: layout_sampling_params(),
-                    priority,
+                    priority: page_priority(page_index),
                 },
             )
             .await?;
-        let mut blocks = parse_layout_output(&layout_output);
-        self.extract_blocks(task, page_index, &page_image, &mut blocks, limiter)
-            .await?;
+        let blocks = parse_layout_output(&layout_output);
 
-        Ok(PageParseResult {
+        Ok(PageLayoutResult {
             page_index,
             page_width: page_image.width(),
             page_height: page_image.height(),
@@ -202,66 +289,6 @@ impl VlmDocumentParser {
             page_image,
             blocks,
         })
-    }
-
-    /// Extract content for all eligible blocks on one page concurrently.
-    ///
-    /// Inputs:
-    /// - `task`: request options and output directory.
-    /// - `page_index`: zero-based page index.
-    /// - `page_image`: source page image used for block crops.
-    /// - `blocks`: layout blocks to update with recognized content.
-    /// - `limiter`: shared per-document VLM request limiter.
-    async fn extract_blocks(
-        &self,
-        task: &ParseTask,
-        page_index: usize,
-        page_image: &DynamicImage,
-        blocks: &mut [ContentBlock],
-        limiter: Arc<Semaphore>,
-    ) -> ApiResult<()> {
-        let skip_types = skip_extract_types(task.image_analysis);
-        let mut jobs = Vec::new();
-        for (block_index, block) in blocks.iter().enumerate() {
-            if skip_types.contains(block.block_type.as_str()) {
-                continue;
-            }
-            let block_image = crop_block_image(page_image, block)?;
-            if block_image.width() < 1 || block_image.height() < 1 {
-                continue;
-            }
-            let block_image = resize_by_need(block_image);
-            let image_png = encode_png(&block_image)?;
-            jobs.push(BlockExtractJob {
-                block_index,
-                block_type: block.block_type.clone(),
-                image_png,
-                store_image: false,
-            });
-        }
-
-        let unordered_results =
-            stream::iter(jobs.into_iter().map(|job| {
-                self.extract_block(task, page_priority(page_index), job, limiter.clone())
-            }))
-            .buffer_unordered(self.vlm_max_concurrency)
-            .collect::<Vec<_>>()
-            .await;
-        let mut results = unordered_results
-            .into_iter()
-            .collect::<ApiResult<Vec<BlockExtractResult>>>()?;
-        results.sort_by_key(|result| result.block_index);
-
-        for result in results {
-            if !result.content.is_empty() {
-                blocks[result.block_index].content = Some(result.content);
-            }
-            if let Some(image_png) = result.image_png {
-                self.write_result_image_bytes(task, page_index, result.block_index, &image_png)
-                    .await?;
-            }
-        }
-        Ok(())
     }
 
     /// Send one block crop to the VLM backend and preserve optional image bytes.
@@ -294,6 +321,7 @@ impl VlmDocumentParser {
             .await?;
 
         Ok(BlockExtractResult {
+            page_index: job.page_index,
             block_index: job.block_index,
             content,
             image_png: result_image_png,
@@ -370,30 +398,63 @@ impl VlmDocumentParser {
         Ok(())
     }
 
-    async fn load_pages(
+    async fn load_image_pages(&self, upload: &StoredUpload) -> ApiResult<Vec<RenderedPage>> {
+        let bytes = fs::read(&upload.path).await?;
+        let image = image::load_from_memory(&bytes)
+            .map_err(|error| ApiError::BadRequest(format!("Failed to load image: {error}")))?;
+        Ok(vec![RenderedPage {
+            page_index: 0,
+            point_width: image.width(),
+            point_height: image.height(),
+            image,
+        }])
+    }
+
+    async fn load_pdf_page_window(
         &self,
-        upload: &StoredUpload,
+        bytes: &[u8],
         start_page_id: usize,
         end_page_id: usize,
-    ) -> ApiResult<Vec<RenderedPage>> {
-        let bytes = fs::read(&upload.path).await?;
-        if upload.suffix == "pdf" {
-            let window_size = self.processing_window_size.max(1);
-            tokio::task::spawn_blocking(move || {
-                render_pdf_pages(&bytes, start_page_id, end_page_id, window_size)
-            })
-            .await
-            .map_err(|error| ApiError::Internal(error.to_string()))?
-        } else {
-            let image = image::load_from_memory(&bytes)
-                .map_err(|error| ApiError::BadRequest(format!("Failed to load image: {error}")))?;
-            Ok(vec![RenderedPage {
-                point_width: image.width(),
-                point_height: image.height(),
-                image,
-            }])
-        }
+    ) -> ApiResult<RenderedPageWindow> {
+        let bytes = bytes.to_vec();
+        let window_size = self.processing_window_size.max(1);
+        tokio::task::spawn_blocking(move || {
+            render_pdf_page_window(&bytes, start_page_id, end_page_id, window_size)
+        })
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
     }
+}
+
+/// Prepare all block extraction jobs for one page after layout detection.
+///
+/// Inputs:
+/// - `task`: request options controlling skipped block types.
+/// - `layout`: page layout result with source page image and detected blocks.
+fn prepare_block_extract_jobs(
+    task: &ParseTask,
+    layout: &PageLayoutResult,
+) -> ApiResult<Vec<BlockExtractJob>> {
+    let skip_types = skip_extract_types(task.image_analysis);
+    let mut jobs = Vec::new();
+    for (block_index, block) in layout.blocks.iter().enumerate() {
+        if skip_types.contains(block.block_type.as_str()) {
+            continue;
+        }
+        let block_image = crop_block_image(&layout.page_image, block)?;
+        if block_image.width() < 1 || block_image.height() < 1 {
+            continue;
+        }
+        let block_image = resize_by_need(block_image);
+        jobs.push(BlockExtractJob {
+            page_index: layout.page_index,
+            block_index,
+            block_type: block.block_type.clone(),
+            image_png: encode_png(&block_image)?,
+            store_image: false,
+        });
+    }
+    Ok(jobs)
 }
 
 pub fn parse_layout_output(output: &str) -> Vec<ContentBlock> {
@@ -455,50 +516,61 @@ fn split_layout_segments(output: &str) -> Vec<String> {
         .collect()
 }
 
-fn render_pdf_pages(
+fn render_pdf_page_window(
     bytes: &[u8],
     start_page_id: usize,
     end_page_id: usize,
     processing_window_size: usize,
-) -> ApiResult<Vec<RenderedPage>> {
+) -> ApiResult<RenderedPageWindow> {
     let pdfium = bind_pdfium()?;
     let document = pdfium
         .load_pdf_from_byte_slice(bytes, None)
         .map_err(|error| ApiError::BadRequest(format!("Failed to open PDF: {error}")))?;
     let page_count = document.pages().len() as usize;
     if page_count == 0 {
-        return Ok(Vec::new());
+        return Ok(RenderedPageWindow {
+            pages: Vec::new(),
+            next_page_id: end_page_id.saturating_add(1),
+        });
     }
     let start = start_page_id.min(page_count - 1);
     let end = end_page_id.min(page_count - 1);
-    let mut images = Vec::new();
-    for window_start in (start..=end).step_by(processing_window_size) {
-        let window_end = end.min(window_start + processing_window_size - 1);
-        for page_index in window_start..=window_end {
-            let page = document
-                .pages()
-                .get(page_index as u16)
-                .map_err(|error| ApiError::Internal(error.to_string()))?;
-            let point_width = page.width().value.round().max(1.0) as u32;
-            let point_height = page.height().value.round().max(1.0) as u32;
-            let width = ((page.width().value / 72.0) * DEFAULT_PDF_IMAGE_DPI).round() as i32;
-            let height = ((page.height().value / 72.0) * DEFAULT_PDF_IMAGE_DPI).round() as i32;
-            let image = page
-                .render_with_config(
-                    &PdfRenderConfig::new()
-                        .set_target_width(width.max(1))
-                        .set_target_height(height.max(1)),
-                )
-                .map_err(|error| ApiError::Internal(error.to_string()))?
-                .as_image();
-            images.push(RenderedPage {
-                image,
-                point_width,
-                point_height,
-            });
-        }
+    if start > end {
+        return Ok(RenderedPageWindow {
+            pages: Vec::new(),
+            next_page_id: end.saturating_add(1),
+        });
     }
-    Ok(images)
+    let window_end = end.min(start + processing_window_size - 1);
+    let mut images = Vec::new();
+    for page_index in start..=window_end {
+        let page = document
+            .pages()
+            .get(page_index as u16)
+            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        let point_width = page.width().value.round().max(1.0) as u32;
+        let point_height = page.height().value.round().max(1.0) as u32;
+        let width = ((page.width().value / 72.0) * DEFAULT_PDF_IMAGE_DPI).round() as i32;
+        let height = ((page.height().value / 72.0) * DEFAULT_PDF_IMAGE_DPI).round() as i32;
+        let image = page
+            .render_with_config(
+                &PdfRenderConfig::new()
+                    .set_target_width(width.max(1))
+                    .set_target_height(height.max(1)),
+            )
+            .map_err(|error| ApiError::Internal(error.to_string()))?
+            .as_image();
+        images.push(RenderedPage {
+            page_index,
+            image,
+            point_width,
+            point_height,
+        });
+    }
+    Ok(RenderedPageWindow {
+        pages: images,
+        next_page_id: window_end.saturating_add(1),
+    })
 }
 
 fn bind_pdfium() -> ApiResult<Pdfium> {
@@ -660,7 +732,67 @@ fn skip_extract_types(image_analysis: bool) -> HashSet<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{bind_pdfium, parse_layout_output};
+    use std::{
+        env,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    use axum::{extract::State, http::StatusCode, routing::get, routing::post, Json, Router};
+    use chrono::Utc;
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
+    use serde_json::{json, Value};
+    use tempfile::tempdir;
+    use tokio::{net::TcpListener, sync::oneshot, time::sleep};
+    use uuid::Uuid;
+
+    use crate::domain::models::{ParseOptions, ParseTask, StoredUpload, TaskStatus};
+    use crate::vlm::client::VlmHttpClient;
+
+    use super::{bind_pdfium, parse_layout_output, VlmDocumentParser};
+
+    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[derive(Clone)]
+    struct TestVlmState {
+        models_count: Arc<AtomicUsize>,
+        chat_count: Arc<AtomicUsize>,
+        active_layouts: Arc<AtomicUsize>,
+        max_active_layouts: Arc<AtomicUsize>,
+        fail_chat: bool,
+    }
+
+    struct EnvVarGuard {
+        name: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let previous = env::var(name).ok();
+            env::set_var(name, value);
+            Self { name, previous }
+        }
+
+        fn unset(name: &'static str) -> Self {
+            let previous = env::var(name).ok();
+            env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.previous {
+                env::set_var(self.name, value);
+            } else {
+                env::remove_var(self.name);
+            }
+        }
+    }
 
     #[test]
     fn binds_bundled_pdfium() {
@@ -683,5 +815,248 @@ mod tests {
             "<|box_start|>0 0 100 100<|box_end|><|ref_start|>inline_formula<|ref_end|>",
         );
         assert!(blocks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn parser_uses_window_layout_then_block_extraction_with_ordered_output() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let _no_proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1,localhost");
+        let (base_url, state, server) = spawn_test_vlm_server(false).await;
+        let _server_url = EnvVarGuard::set("MINERU_VL_SERVER", &base_url);
+        let _model_name = EnvVarGuard::unset("MINERU_VL_MODEL_NAME");
+        let temp = tempdir().expect("temp dir");
+        let upload_path = temp.path().join("sample.png");
+        ImageBuffer::from_pixel(8, 8, Rgb([255_u8, 255, 255]))
+            .save_with_format(&upload_path, ImageFormat::Png)
+            .expect("png fixture");
+        let task = completed_test_task(temp.path().to_path_buf(), upload_path);
+        let parser = VlmDocumentParser::new(Arc::new(VlmHttpClient::new()), 4, 4);
+
+        let file_names = parser.parse_task(&task).await.expect("parse succeeds");
+
+        server.abort();
+        assert_eq!(file_names, vec!["sample"]);
+        assert_eq!(state.models_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.chat_count.load(Ordering::SeqCst), 2);
+        assert!(state.max_active_layouts.load(Ordering::SeqCst) >= 1);
+        let markdown =
+            tokio::fs::read_to_string(temp.path().join("sample").join("vlm").join("sample.md"))
+                .await
+                .expect("markdown should be written");
+        assert!(markdown.contains("recognized text"));
+    }
+
+    #[tokio::test]
+    async fn page_window_runs_layouts_before_window_block_extraction() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let _no_proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1,localhost");
+        let (base_url, state, server) = spawn_test_vlm_server(false).await;
+        let _server_url = EnvVarGuard::set("MINERU_VL_SERVER", &base_url);
+        let _model_name = EnvVarGuard::unset("MINERU_VL_MODEL_NAME");
+        let temp = tempdir().expect("temp dir");
+        let task = ParseTask::new(
+            Uuid::new_v4(),
+            &ParseOptions::default(),
+            vec![StoredUpload {
+                stem: "sample".to_string(),
+                path: temp.path().join("sample.png"),
+                suffix: "png".to_string(),
+            }],
+            temp.path().to_path_buf(),
+        );
+        let parser = VlmDocumentParser::new(Arc::new(VlmHttpClient::new()), 2, 2);
+        let pages = vec![
+            rendered_test_page(1, [255, 0, 0]),
+            rendered_test_page(0, [0, 255, 0]),
+        ];
+
+        let results = parser
+            .parse_page_window(&task, pages, Arc::new(tokio::sync::Semaphore::new(2)))
+            .await
+            .expect("window parse succeeds");
+
+        server.abort();
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.page_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(state.models_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.chat_count.load(Ordering::SeqCst), 4);
+        assert_eq!(state.max_active_layouts.load(Ordering::SeqCst), 2);
+        assert!(results
+            .iter()
+            .all(|result| result.blocks[0].content.as_deref() == Some("recognized text")));
+    }
+
+    #[tokio::test]
+    async fn parser_surfaces_chat_completion_failures() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let _no_proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1,localhost");
+        let (base_url, _state, server) = spawn_test_vlm_server(true).await;
+        let _server_url = EnvVarGuard::set("MINERU_VL_SERVER", &base_url);
+        let _model_name = EnvVarGuard::unset("MINERU_VL_MODEL_NAME");
+        let temp = tempdir().expect("temp dir");
+        let upload_path = temp.path().join("sample.png");
+        ImageBuffer::from_pixel(8, 8, Rgb([255_u8, 255, 255]))
+            .save_with_format(&upload_path, ImageFormat::Png)
+            .expect("png fixture");
+        let task = completed_test_task(temp.path().to_path_buf(), upload_path);
+        let parser = VlmDocumentParser::new(Arc::new(VlmHttpClient::new()), 4, 4);
+
+        let error = parser.parse_task(&task).await.expect_err("parse fails");
+
+        server.abort();
+        assert!(error.detail().contains("500 Internal Server Error"));
+    }
+
+    async fn spawn_test_vlm_server(
+        fail_chat: bool,
+    ) -> (String, TestVlmState, tokio::task::JoinHandle<()>) {
+        let state = TestVlmState {
+            models_count: Arc::new(AtomicUsize::new(0)),
+            chat_count: Arc::new(AtomicUsize::new(0)),
+            active_layouts: Arc::new(AtomicUsize::new(0)),
+            max_active_layouts: Arc::new(AtomicUsize::new(0)),
+            fail_chat,
+        };
+        let app = Router::new()
+            .route("/v1/models", post(test_models).get(test_models))
+            .route("/v1/chat/completions", post(test_chat_completions))
+            .route("/ready", get(|| async { "ok" }))
+            .with_state(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server must bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let _ = ready_sender.send(());
+            axum::serve(listener, app)
+                .await
+                .expect("test server must run");
+        });
+        ready_receiver.await.expect("server should start");
+        wait_until_ready(&base_url).await;
+        (base_url, state, server)
+    }
+
+    async fn wait_until_ready(base_url: &str) {
+        let ready_url = format!("{base_url}/ready");
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("ready client should build");
+        for _ in 0..100 {
+            if let Ok(response) = client.get(&ready_url).send().await {
+                if response.status().is_success() {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        panic!("test server did not become ready");
+    }
+
+    async fn test_models(State(state): State<TestVlmState>) -> Json<Value> {
+        state.models_count.fetch_add(1, Ordering::SeqCst);
+        Json(json!({
+            "object": "list",
+            "data": [{ "id": "test-model", "object": "model" }]
+        }))
+    }
+
+    async fn test_chat_completions(
+        State(state): State<TestVlmState>,
+        Json(payload): Json<Value>,
+    ) -> Result<Json<Value>, StatusCode> {
+        state.chat_count.fetch_add(1, Ordering::SeqCst);
+        if state.fail_chat {
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
+        }
+        let prompt = extract_prompt_text(&payload);
+        if prompt.contains("Layout Detection") {
+            let active = state.active_layouts.fetch_add(1, Ordering::SeqCst) + 1;
+            state.max_active_layouts.fetch_max(active, Ordering::SeqCst);
+            sleep(Duration::from_millis(20)).await;
+            state.active_layouts.fetch_sub(1, Ordering::SeqCst);
+            return Ok(Json(chat_payload(
+                "<|box_start|>0 0 1000 1000<|box_end|><|ref_start|>text<|ref_end|>",
+            )));
+        }
+        Ok(Json(chat_payload("recognized text")))
+    }
+
+    fn extract_prompt_text(payload: &Value) -> String {
+        payload
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.get(1))
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .and_then(|content| content.last())
+            .and_then(|item| item.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn chat_payload(content: &str) -> Value {
+        json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": { "role": "assistant", "content": content }
+            }]
+        })
+    }
+
+    fn rendered_test_page(page_index: usize, color: [u8; 3]) -> super::RenderedPage {
+        let image = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(
+            8,
+            8,
+            Rgb([color[0], color[1], color[2]]),
+        ));
+        super::RenderedPage {
+            page_index,
+            point_width: image.width(),
+            point_height: image.height(),
+            image,
+        }
+    }
+
+    fn completed_test_task(
+        output_dir: std::path::PathBuf,
+        upload_path: std::path::PathBuf,
+    ) -> ParseTask {
+        ParseTask {
+            task_id: Uuid::new_v4(),
+            status: TaskStatus::Completed,
+            backend: "vlm-http-client".to_string(),
+            file_names: vec!["sample".to_string()],
+            created_at: Utc::now(),
+            output_dir,
+            image_analysis: true,
+            server_url: None,
+            return_md: true,
+            return_middle_json: true,
+            return_model_output: true,
+            return_content_list: true,
+            return_images: true,
+            response_format_zip: false,
+            return_original_file: false,
+            start_page_id: 0,
+            end_page_id: 99999,
+            uploads: vec![upload_path],
+            upload_suffixes: vec!["png".to_string()],
+            submit_order: 0,
+            started_at: None,
+            completed_at: Some(Utc::now()),
+            error: None,
+        }
     }
 }
