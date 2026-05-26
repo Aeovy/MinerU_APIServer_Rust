@@ -24,7 +24,7 @@ use super::client::{
     layout_prompt, layout_sampling_params, prompt_for_block, sampling_params_for_block,
     VlmHttpClient, VlmRequest, VlmSession,
 };
-use super::python_compat::{build_document_output, PythonPageInput};
+use super::python_compat::{PythonDocumentBuilder, PythonPageInput};
 
 const DEFAULT_PDF_IMAGE_DPI: f32 = 200.0;
 const LAYOUT_IMAGE_SIZE: u32 = 1036;
@@ -48,6 +48,20 @@ struct PageParseResult {
     point_height: u32,
     page_image: Arc<DynamicImage>,
     blocks: Vec<ContentBlock>,
+}
+
+impl PageParseResult {
+    fn into_python_input(self) -> PythonPageInput {
+        PythonPageInput {
+            page_index: self.page_index,
+            page_width: self.page_width,
+            page_height: self.page_height,
+            point_width: self.point_width,
+            point_height: self.point_height,
+            image: self.page_image,
+            blocks: self.blocks,
+        }
+    }
 }
 
 struct RenderedPage {
@@ -177,7 +191,9 @@ impl VlmDocumentParser {
             elapsed_ms = session_started_at.elapsed().as_millis(),
             "vlm session resolved"
         );
-        let mut page_results = Vec::new();
+        let pending_image_dir = task.output_dir.join("_pending_images");
+        let mut output_builder = PythonDocumentBuilder::new();
+        let mut page_count = 0_usize;
         tracing::debug!(
             task_id = %task.task_id,
             file_name = %upload.stem,
@@ -232,10 +248,19 @@ impl VlmDocumentParser {
                     "pdf page window rendered"
                 );
                 let parse_window_started_at = Instant::now();
-                page_results.extend(
-                    self.parse_page_window(task, &session, window.pages, limiter.clone())
-                        .await?,
-                );
+                let page_results = self
+                    .parse_page_window(task, &session, window.pages, limiter.clone())
+                    .await?;
+                page_count += page_results.len();
+                output_builder
+                    .append_pages(
+                        page_results
+                            .into_iter()
+                            .map(PageParseResult::into_python_input)
+                            .collect(),
+                        &pending_image_dir,
+                    )
+                    .await?;
                 tracing::debug!(
                     task_id = %task.task_id,
                     file_name = %upload.stem,
@@ -260,10 +285,19 @@ impl VlmDocumentParser {
                 "image pages loaded"
             );
             let parse_window_started_at = Instant::now();
-            page_results.extend(
-                self.parse_page_window(task, &session, pages, limiter.clone())
-                    .await?,
-            );
+            let page_results = self
+                .parse_page_window(task, &session, pages, limiter.clone())
+                .await?;
+            page_count += page_results.len();
+            output_builder
+                .append_pages(
+                    page_results
+                        .into_iter()
+                        .map(PageParseResult::into_python_input)
+                        .collect(),
+                    &pending_image_dir,
+                )
+                .await?;
             tracing::debug!(
                 task_id = %task.task_id,
                 file_name = %upload.stem,
@@ -272,23 +306,8 @@ impl VlmDocumentParser {
             );
         }
 
-        page_results.sort_by_key(|result| result.page_index);
-        let page_count = page_results.len();
         let output_started_at = Instant::now();
-        let python_pages = page_results
-            .into_iter()
-            .map(|result| PythonPageInput {
-                page_index: result.page_index,
-                page_width: result.page_width,
-                page_height: result.page_height,
-                point_width: result.point_width,
-                point_height: result.point_height,
-                image: (*result.page_image).clone(),
-                blocks: result.blocks,
-            })
-            .collect::<Vec<_>>();
-        let output =
-            build_document_output(&python_pages, &task.output_dir.join("_pending_images")).await?;
+        let output = output_builder.finish();
         tracing::debug!(
             task_id = %task.task_id,
             file_name = %upload.stem,
