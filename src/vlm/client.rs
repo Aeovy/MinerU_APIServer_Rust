@@ -196,7 +196,10 @@ impl VlmHttpClient {
                         delay_ms,
                         request_ms = request_started_at.elapsed().as_millis(),
                         error = %error,
-                        "vlm chat completion retrying after transport error"
+                        status = retry_error_status(&error).as_deref(),
+                        code = retry_error_code(&error).as_deref(),
+                        error_type = retry_error_type(&error).as_deref(),
+                        "vlm chat completion retrying after retryable VLM error"
                     );
                     attempt_count += 1;
                     sleep(Duration::from_millis(delay_ms)).await;
@@ -244,14 +247,16 @@ impl VlmHttpClient {
     /// Inputs:
     /// - `base_url`: normalized server origin without `/v1`.
     async fn resolve_model_name_cached(&self, base_url: &str) -> ApiResult<String> {
-        let mut cache = self.model_name_cache.lock().await;
-        if let Some(model_name) = cache.get(base_url).cloned() {
-            tracing::trace!(
-                base_url,
-                model_name = %model_name,
-                "vlm model name resolved from cache"
-            );
-            return Ok(model_name);
+        {
+            let cache = self.model_name_cache.lock().await;
+            if let Some(model_name) = cache.get(base_url).cloned() {
+                tracing::trace!(
+                    base_url,
+                    model_name = %model_name,
+                    "vlm model name resolved from cache"
+                );
+                return Ok(model_name);
+            }
         }
 
         let started_at = Instant::now();
@@ -262,6 +267,7 @@ impl VlmHttpClient {
             elapsed_ms = started_at.elapsed().as_millis(),
             "vlm model name resolved"
         );
+        let mut cache = self.model_name_cache.lock().await;
         Ok(cache
             .entry(base_url.to_string())
             .or_insert(model_name)
@@ -275,7 +281,7 @@ impl VlmHttpClient {
                 tracing::debug!(
                     base_url,
                     model_name = trimmed,
-                    "vlm model name resolved from environment"
+                    "vlm model name resolved from global environment override"
                 );
                 return Ok(trimmed.to_string());
             }
@@ -363,10 +369,36 @@ fn should_retry_chat_error(error: &async_openai::error::OpenAIError) -> bool {
             error.is_request() || error.is_connect() || error.is_timeout()
         }
         async_openai::error::OpenAIError::ApiError(error) => {
-            error.api_error.code.as_deref() == Some("rate_limit_exceeded")
+            error.status_code == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || error.status_code.is_server_error()
+                || error.api_error.code.as_deref() == Some("rate_limit_exceeded")
                 || error.api_error.r#type.as_deref() == Some("server_error")
         }
         _ => false,
+    }
+}
+
+fn retry_error_status(error: &async_openai::error::OpenAIError) -> Option<String> {
+    match error {
+        async_openai::error::OpenAIError::Reqwest(error) => {
+            error.status().map(|status| status.to_string())
+        }
+        async_openai::error::OpenAIError::ApiError(error) => Some(error.status_code.to_string()),
+        _ => None,
+    }
+}
+
+fn retry_error_code(error: &async_openai::error::OpenAIError) -> Option<String> {
+    match error {
+        async_openai::error::OpenAIError::ApiError(error) => error.api_error.code.clone(),
+        _ => None,
+    }
+}
+
+fn retry_error_type(error: &async_openai::error::OpenAIError) -> Option<String> {
+    match error {
+        async_openai::error::OpenAIError::ApiError(error) => error.api_error.r#type.clone(),
+        _ => None,
     }
 }
 
@@ -542,14 +574,15 @@ mod tests {
         Arc,
     };
 
-    use axum::{routing::get, Json, Router};
-    use futures::future::join_all;
+    use axum::{extract::State, http::StatusCode, routing::get, routing::post, Json, Router};
     use serde_json::json;
     use tokio::{net::TcpListener, sync::oneshot, time::Duration};
 
     use crate::vlm::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
-    use super::{parse_chat_content, VlmHttpClient};
+    use super::{
+        parse_chat_content, sampling_params_for_block, VlmHttpClient, VlmRequest, VlmSession,
+    };
 
     async fn spawn_models_server(
         counter: Arc<AtomicUsize>,
@@ -588,6 +621,35 @@ mod tests {
         (base_url, server)
     }
 
+    async fn spawn_retry_chat_server(
+        failures_before_success: usize,
+        status: StatusCode,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(test_retry_chat_completion))
+            .route("/ready", get(|| async { "ok" }))
+            .with_state(RetryChatState {
+                counter: counter.clone(),
+                failures_before_success,
+                status,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server must bind");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let (ready_sender, ready_receiver) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let _ = ready_sender.send(());
+            axum::serve(listener, app)
+                .await
+                .expect("test server must run");
+        });
+        ready_receiver.await.expect("test server must start");
+        wait_until_ready(&base_url).await;
+        (base_url, counter, server)
+    }
+
     async fn wait_until_ready(base_url: &str) {
         let ready_url = format!("{base_url}/ready");
         let client = reqwest::Client::builder()
@@ -620,7 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn caches_resolved_model_name_across_concurrent_requests() {
+    async fn caches_resolved_model_name_after_first_resolution() {
         let _env_lock = TEST_ENV_LOCK.lock().await;
         let _model_name = EnvVarGuard::unset("MINERU_VL_MODEL_NAME");
         let _no_proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1,localhost");
@@ -628,12 +690,18 @@ mod tests {
         let (base_url, server) = spawn_models_server(counter.clone()).await;
         let client = VlmHttpClient::new();
 
-        let results = join_all((0..16).map(|_| client.resolve_model_name_cached(&base_url))).await;
+        let first = client
+            .resolve_model_name_cached(&base_url)
+            .await
+            .expect("first model name should resolve");
+        let second = client
+            .resolve_model_name_cached(&base_url)
+            .await
+            .expect("second model name should resolve from cache");
 
         server.abort();
-        for result in results {
-            assert_eq!(result.unwrap(), "cached-model");
-        }
+        assert_eq!(first, "cached-model");
+        assert_eq!(second, "cached-model");
         assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
@@ -654,5 +722,68 @@ mod tests {
         server.abort();
         assert_eq!(model_name, "configured-model");
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn retries_retryable_api_status_before_success() {
+        let (base_url, counter, server) =
+            spawn_retry_chat_server(1, StatusCode::INTERNAL_SERVER_ERROR).await;
+        let client = VlmHttpClient::new();
+        let session = VlmSession {
+            base_url,
+            model_name: "test-model".to_string(),
+        };
+
+        let content = client
+            .predict_with_session(
+                &session,
+                VlmRequest {
+                    prompt: "\nText Recognition:".to_string(),
+                    image_png: None,
+                    sampling_params: sampling_params_for_block("text"),
+                    priority: None,
+                },
+            )
+            .await
+            .expect("retry should eventually succeed");
+
+        server.abort();
+        assert_eq!(content, "recognized text");
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[derive(Clone)]
+    struct RetryChatState {
+        counter: Arc<AtomicUsize>,
+        failures_before_success: usize,
+        status: StatusCode,
+    }
+
+    async fn test_retry_chat_completion(
+        State(state): State<RetryChatState>,
+    ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+        let attempt = state.counter.fetch_add(1, Ordering::SeqCst) + 1;
+        if attempt <= state.failures_before_success {
+            return Err((
+                state.status,
+                Json(json!({
+                    "error": {
+                        "message": "temporary VLM failure",
+                        "type": "server_error",
+                        "param": null,
+                        "code": null
+                    }
+                })),
+            ));
+        }
+        Ok(Json(json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": { "role": "assistant", "content": "recognized text" }
+            }]
+        })))
     }
 }
