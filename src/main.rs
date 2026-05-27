@@ -15,6 +15,7 @@ use crate::server::state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    load_dotenv();
     init_tracing();
 
     let args = CliArgs::parse();
@@ -54,6 +55,13 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .await
         .context("MinerU API server stopped unexpectedly")
+}
+
+/// Load local `.env` before tracing and config read environment variables.
+///
+/// Existing process environment values keep priority over `.env` values.
+fn load_dotenv() {
+    let _ = dotenvy::dotenv();
 }
 
 fn init_tracing() {
