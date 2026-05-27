@@ -37,6 +37,7 @@ pub struct VlmDocumentParser {
     client: Arc<VlmHttpClient>,
     processing_window_size: usize,
     vlm_max_concurrency: usize,
+    vlm_semaphore: Arc<Semaphore>,
     image_preprocess_pool: Arc<rayon::ThreadPool>,
 }
 
@@ -127,8 +128,13 @@ impl VlmDocumentParser {
             client,
             processing_window_size,
             vlm_max_concurrency: vlm_max_concurrency.max(1),
+            vlm_semaphore: Arc::new(Semaphore::new(vlm_max_concurrency.max(1))),
             image_preprocess_pool: Arc::new(image_preprocess_pool),
         })
+    }
+
+    pub fn available_vlm_permits(&self) -> usize {
+        self.vlm_semaphore.available_permits()
     }
 
     /// Parse all uploads in a task and persist MinerU-compatible result files.
@@ -179,7 +185,6 @@ impl VlmDocumentParser {
         upload: &StoredUpload,
     ) -> ApiResult<ParsedDocument> {
         let started_at = Instant::now();
-        let limiter = Arc::new(Semaphore::new(self.vlm_max_concurrency));
         let session_started_at = Instant::now();
         let session = self
             .client
@@ -207,7 +212,7 @@ impl VlmDocumentParser {
 
         if upload.suffix == "pdf" {
             let read_started_at = Instant::now();
-            let bytes = fs::read(&upload.path).await?;
+            let bytes = Arc::<[u8]>::from(fs::read(&upload.path).await?);
             tracing::debug!(
                 task_id = %task.task_id,
                 file_name = %upload.stem,
@@ -220,7 +225,7 @@ impl VlmDocumentParser {
                 let render_started_at = Instant::now();
                 let requested_start_page = next_page_id;
                 let window = self
-                    .load_pdf_page_window(&bytes, next_page_id, task.end_page_id)
+                    .load_pdf_page_window(bytes.clone(), next_page_id, task.end_page_id)
                     .await?;
                 let render_elapsed_ms = render_started_at.elapsed().as_millis();
                 if window.pages.is_empty() {
@@ -248,9 +253,7 @@ impl VlmDocumentParser {
                     "pdf page window rendered"
                 );
                 let parse_window_started_at = Instant::now();
-                let page_results = self
-                    .parse_page_window(task, &session, window.pages, limiter.clone())
-                    .await?;
+                let page_results = self.parse_page_window(task, &session, window.pages).await?;
                 page_count += page_results.len();
                 output_builder
                     .append_pages(
@@ -285,9 +288,7 @@ impl VlmDocumentParser {
                 "image pages loaded"
             );
             let parse_window_started_at = Instant::now();
-            let page_results = self
-                .parse_page_window(task, &session, pages, limiter.clone())
-                .await?;
+            let page_results = self.parse_page_window(task, &session, pages).await?;
             page_count += page_results.len();
             output_builder
                 .append_pages(
@@ -340,13 +341,11 @@ impl VlmDocumentParser {
     /// Inputs:
     /// - `task`: request options and output directory.
     /// - `pages`: rendered page images in one processing window.
-    /// - `limiter`: shared per-document VLM request limiter.
     async fn parse_page_window(
         &self,
         task: &ParseTask,
         session: &VlmSession,
         pages: Vec<RenderedPage>,
-        limiter: Arc<Semaphore>,
     ) -> ApiResult<Vec<PageParseResult>> {
         let started_at = Instant::now();
         let page_count = pages.len();
@@ -360,6 +359,7 @@ impl VlmDocumentParser {
             "page window parse started"
         );
         let layout_started_at = Instant::now();
+        let limiter = self.vlm_semaphore.clone();
         let prepared_pages =
             prepare_window_layout_images_async(self.image_preprocess_pool.clone(), pages).await?;
         let mut layouts = self
@@ -454,7 +454,7 @@ impl VlmDocumentParser {
     /// Inputs:
     /// - `task`: request options and output directory.
     /// - `page`: rendered PDF page or uploaded image.
-    /// - `limiter`: shared per-document VLM request limiter.
+    /// - `limiter`: global VLM request limiter shared by all documents.
     async fn detect_page_layout(
         &self,
         task: &ParseTask,
@@ -514,7 +514,7 @@ impl VlmDocumentParser {
     ///
     /// Inputs:
     /// - `prepared_pages`: rendered pages plus layout PNG bytes already prepared on the CPU pool.
-    /// - `limiter`: shared per-document VLM request limiter.
+    /// - `limiter`: global VLM request limiter shared by all documents.
     async fn detect_window_layouts(
         &self,
         task: &ParseTask,
@@ -523,10 +523,11 @@ impl VlmDocumentParser {
         limiter: Arc<Semaphore>,
     ) -> ApiResult<Vec<PageLayoutResult>> {
         let mut layouts = Vec::with_capacity(prepared_pages.len());
+        let concurrency = prepared_pages.len().min(self.vlm_max_concurrency).max(1);
         let mut pending = stream::iter(prepared_pages.into_iter().map(|prepared_page| {
             self.detect_page_layout(task, session, prepared_page, limiter.clone())
         }))
-        .buffer_unordered(self.vlm_max_concurrency);
+        .buffer_unordered(concurrency);
 
         while let Some(result) = pending.next().await {
             match result {
@@ -550,7 +551,7 @@ impl VlmDocumentParser {
     /// - `task`: request options copied from the multipart form.
     /// - `priority`: backend scheduling priority.
     /// - `job`: prepared block image, prompt type, and output-image flag.
-    /// - `limiter`: shared per-document VLM request limiter.
+    /// - `limiter`: global VLM request limiter shared by all documents.
     async fn extract_block(
         &self,
         task: &ParseTask,
@@ -601,7 +602,7 @@ impl VlmDocumentParser {
     ///
     /// Inputs:
     /// - `jobs`: block crop requests already prepared as PNG bytes.
-    /// - `limiter`: shared VLM request limiter for this document.
+    /// - `limiter`: global VLM request limiter shared by all documents.
     async fn extract_window_blocks(
         &self,
         task: &ParseTask,
@@ -610,6 +611,7 @@ impl VlmDocumentParser {
         limiter: Arc<Semaphore>,
     ) -> ApiResult<Vec<BlockExtractResult>> {
         let mut extracts = Vec::with_capacity(jobs.len());
+        let concurrency = jobs.len().min(self.vlm_max_concurrency).max(1);
         let mut pending = stream::iter(jobs.into_iter().map(|job| {
             self.extract_block(
                 task,
@@ -619,7 +621,7 @@ impl VlmDocumentParser {
                 limiter.clone(),
             )
         }))
-        .buffer_unordered(self.vlm_max_concurrency);
+        .buffer_unordered(concurrency);
 
         while let Some(result) = pending.next().await {
             match result {
@@ -637,10 +639,10 @@ impl VlmDocumentParser {
         Ok(extracts)
     }
 
-    /// Execute one VLM request under the per-document concurrency limit.
+    /// Execute one VLM request under the global concurrency limit.
     ///
     /// Inputs:
-    /// - `limiter`: semaphore shared by all page and block requests in this document.
+    /// - `limiter`: semaphore shared by all page and block requests in this process.
     /// - `request`: OpenAI-compatible chat completion payload data.
     async fn predict_with_limit(
         &self,
@@ -750,11 +752,10 @@ impl VlmDocumentParser {
 
     async fn load_pdf_page_window(
         &self,
-        bytes: &[u8],
+        bytes: Arc<[u8]>,
         start_page_id: usize,
         end_page_id: usize,
     ) -> ApiResult<RenderedPageWindow> {
-        let bytes = bytes.to_vec();
         let window_size = self.processing_window_size.max(1);
         let started_at = Instant::now();
         tokio::task::spawn_blocking(move || {
@@ -1391,12 +1392,7 @@ mod tests {
         ];
 
         let results = parser
-            .parse_page_window(
-                &task,
-                &session,
-                pages,
-                Arc::new(tokio::sync::Semaphore::new(2)),
-            )
+            .parse_page_window(&task, &session, pages)
             .await
             .expect("window parse succeeds");
 
@@ -1414,6 +1410,44 @@ mod tests {
         assert!(results
             .iter()
             .all(|result| result.blocks[0].content.as_deref() == Some("recognized text")));
+    }
+
+    #[tokio::test]
+    async fn parser_uses_global_vlm_limit_across_concurrent_windows() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let _no_proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1,localhost");
+        let (base_url, state, server) = spawn_test_vlm_server(false).await;
+        let _server_url = EnvVarGuard::set("MINERU_VL_SERVER", &base_url);
+        let _model_name = EnvVarGuard::unset("MINERU_VL_MODEL_NAME");
+        let temp = tempdir().expect("temp dir");
+        let task = ParseTask::new(
+            Uuid::new_v4(),
+            &ParseOptions::default(),
+            vec![StoredUpload {
+                stem: "sample".to_string(),
+                path: temp.path().join("sample.png"),
+                suffix: "png".to_string(),
+            }],
+            temp.path().to_path_buf(),
+        );
+        let client = Arc::new(VlmHttpClient::new());
+        let session = client
+            .session_for_request(task.server_url.as_deref())
+            .await
+            .expect("session should resolve");
+        let parser = VlmDocumentParser::new(client, 2, 1, 2).expect("parser builds");
+
+        let first =
+            parser.parse_page_window(&task, &session, vec![rendered_test_page(0, [1, 2, 3])]);
+        let second =
+            parser.parse_page_window(&task, &session, vec![rendered_test_page(1, [4, 5, 6])]);
+        let (first, second) = tokio::join!(first, second);
+
+        server.abort();
+        first.expect("first window should parse");
+        second.expect("second window should parse");
+        assert_eq!(state.max_active_layouts.load(Ordering::SeqCst), 1);
+        assert_eq!(parser.available_vlm_permits(), 1);
     }
 
     #[tokio::test]
@@ -1467,14 +1501,7 @@ mod tests {
             rendered_test_page(1, [0, 255, 0]),
         ];
 
-        let result = parser
-            .parse_page_window(
-                &task,
-                &session,
-                pages,
-                Arc::new(tokio::sync::Semaphore::new(1)),
-            )
-            .await;
+        let result = parser.parse_page_window(&task, &session, pages).await;
         let error = match result {
             Ok(_) => panic!("layout error should fail the window"),
             Err(error) => error,

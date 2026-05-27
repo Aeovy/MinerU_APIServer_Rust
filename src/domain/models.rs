@@ -232,9 +232,12 @@ pub struct HealthPayload {
     pub completed_tasks: usize,
     pub failed_tasks: usize,
     pub max_concurrent_requests: usize,
+    pub max_in_flight_tasks: usize,
+    pub available_admission_permits: usize,
     pub max_upload_size_bytes: usize,
     pub processing_window_size: usize,
     pub vlm_max_concurrency: usize,
+    pub available_vlm_permits: usize,
     pub task_retention_seconds: u64,
     pub task_cleanup_interval_seconds: u64,
 }

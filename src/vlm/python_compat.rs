@@ -127,22 +127,6 @@ struct PyBlock {
     merge_prev: Option<bool>,
 }
 
-/// Build all Python-compatible VLM output files from post-extraction Rust blocks.
-///
-/// Inputs:
-/// - `pages`: parsed page images and raw VLM blocks.
-/// - `pending_image_dir`: temporary directory for Python-style cropped JPEG assets.
-pub async fn build_document_output(
-    pages: &[PythonPageInput],
-    pending_image_dir: &Path,
-) -> ApiResult<PythonDocumentOutput> {
-    let mut builder = DocumentOutputAccumulator::new();
-    builder
-        .append_pages(pages.to_vec(), pending_image_dir)
-        .await?;
-    Ok(builder.finish())
-}
-
 #[derive(Debug, Clone)]
 struct PageInfo {
     preproc_blocks: Vec<PyBlock>,
@@ -1593,9 +1577,12 @@ mod tests {
 
         let pages = load_fixture_pages(&python_model_path);
         let temp = tempfile::tempdir().expect("tempdir should be created");
-        let output = build_document_output(&pages, temp.path())
+        let mut builder = DocumentOutputAccumulator::new();
+        builder
+            .append_pages(pages, temp.path())
             .await
             .expect("fixture output should build");
+        let output = builder.finish();
         let python_content: Value = serde_json::from_slice(
             &std::fs::read(
                 python_dir.join("NIPS-2017-attention-is-all-you-need-Paper(1)_content_list.json"),

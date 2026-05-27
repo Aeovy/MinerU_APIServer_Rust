@@ -18,6 +18,7 @@ pub struct AppStateInner {
     pub config: ServiceConfig,
     pub task_manager: Arc<TaskManager>,
     pub parser: Arc<VlmDocumentParser>,
+    pub admission_semaphore: Arc<Semaphore>,
     pub request_semaphore: Arc<Semaphore>,
 }
 
@@ -39,12 +40,14 @@ impl AppState {
             config.vlm_max_concurrency,
             config.image_preprocess_threads,
         )?);
+        let admission_semaphore = Arc::new(Semaphore::new(config.max_in_flight_tasks));
         let request_semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         let state = Self {
             inner: Arc::new(AppStateInner {
                 config,
                 task_manager,
                 parser,
+                admission_semaphore,
                 request_semaphore,
             }),
         };
@@ -62,6 +65,18 @@ impl AppState {
 
     pub fn parser(&self) -> Arc<VlmDocumentParser> {
         self.inner.parser.clone()
+    }
+
+    pub fn admission_semaphore(&self) -> Arc<Semaphore> {
+        self.inner.admission_semaphore.clone()
+    }
+
+    pub fn available_admission_permits(&self) -> usize {
+        self.inner.admission_semaphore.available_permits()
+    }
+
+    pub fn available_vlm_permits(&self) -> usize {
+        self.inner.parser.available_vlm_permits()
     }
 
     pub fn request_semaphore(&self) -> Arc<Semaphore> {

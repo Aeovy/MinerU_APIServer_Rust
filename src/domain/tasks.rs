@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -26,6 +26,57 @@ pub struct TaskStats {
 struct TaskEntry {
     task: ParseTask,
     notify: Arc<Notify>,
+    active_result_readers: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+pub struct ResultReadLease {
+    active_result_readers: Arc<AtomicUsize>,
+}
+
+impl Drop for ResultReadLease {
+    fn drop(&mut self) {
+        self.active_result_readers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use uuid::Uuid;
+
+    use crate::domain::models::{ParseOptions, ParseTask};
+
+    use super::TaskManager;
+
+    #[tokio::test]
+    async fn cleanup_skips_tasks_with_active_result_lease() {
+        let manager = TaskManager::new(Duration::from_millis(1));
+        let output_dir = tempfile::tempdir().expect("tempdir should be created");
+        let task_id = Uuid::new_v4();
+        let task = ParseTask::new(
+            task_id,
+            &ParseOptions::default(),
+            Vec::new(),
+            output_dir.path().to_path_buf(),
+        );
+        manager.submit(task).await;
+        manager.set_completed(task_id, Vec::new()).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+
+        let lease = manager
+            .acquire_result_lease(task_id)
+            .await
+            .expect("lease should be acquired");
+        assert!(manager.cleanup_expired().await.is_empty());
+
+        drop(lease);
+        assert_eq!(
+            manager.cleanup_expired().await,
+            vec![output_dir.path().to_path_buf()]
+        );
+    }
 }
 
 #[derive(Debug)]
@@ -51,11 +102,16 @@ impl TaskManager {
     pub async fn submit(&self, mut task: ParseTask) -> ParseTask {
         task.submit_order = self.next_submit_order.fetch_add(1, Ordering::SeqCst);
         let notify = Arc::new(Notify::new());
+        let active_result_readers = Arc::new(AtomicUsize::new(0));
         let snapshot = task.clone();
-        self.tasks
-            .write()
-            .await
-            .insert(task.task_id, TaskEntry { task, notify });
+        self.tasks.write().await.insert(
+            task.task_id,
+            TaskEntry {
+                task,
+                notify,
+                active_result_readers,
+            },
+        );
         snapshot
     }
 
@@ -140,6 +196,15 @@ impl TaskManager {
         stats
     }
 
+    pub async fn acquire_result_lease(&self, task_id: Uuid) -> Option<ResultReadLease> {
+        let tasks = self.tasks.read().await;
+        let entry = tasks.get(&task_id)?;
+        entry.active_result_readers.fetch_add(1, Ordering::SeqCst);
+        Some(ResultReadLease {
+            active_result_readers: entry.active_result_readers.clone(),
+        })
+    }
+
     pub async fn status_payload(&self, task: &ParseTask, base_url: &str) -> StatusPayload {
         StatusPayload {
             task_id: task.task_id.to_string(),
@@ -167,6 +232,9 @@ impl TaskManager {
             .iter()
             .filter_map(|(task_id, entry)| {
                 if !entry.task.status.is_terminal() {
+                    return None;
+                }
+                if entry.active_result_readers.load(Ordering::SeqCst) > 0 {
                     return None;
                 }
                 let completed_at = entry.task.completed_at?;

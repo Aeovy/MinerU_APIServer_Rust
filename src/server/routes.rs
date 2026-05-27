@@ -7,6 +7,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::time::Instant;
+use tokio::sync::OwnedSemaphorePermit;
 use tower_http::{
     compression::{
         predicate::{DefaultPredicate, NotForContentType, Predicate},
@@ -72,6 +73,7 @@ pub(crate) async fn file_parse(
 ) -> ApiResult<Response> {
     let started_at = Instant::now();
     let base_url = base_url_from_headers(&headers);
+    let admission_permit = acquire_admission_permit(&state).await?;
     let task = create_async_parse_task(&state, multipart).await?;
     let task_manager = state.task_manager();
     let task_id = task.task_id;
@@ -87,7 +89,7 @@ pub(crate) async fn file_parse(
         elapsed_ms = started_at.elapsed().as_millis(),
         "file_parse task created"
     );
-    spawn_task_processor(state.clone(), task);
+    spawn_task_processor(state.clone(), task, admission_permit);
     let wait_started_at = Instant::now();
     let completed = task_manager.wait_terminal(task_id).await.ok_or_else(|| {
         ApiError::ServiceUnavailable("Task was removed before completion".to_string())
@@ -109,6 +111,12 @@ pub(crate) async fn file_parse(
     }
 
     let status_payload = task_manager.status_payload(&completed, &base_url).await;
+    let result_lease = task_manager
+        .acquire_result_lease(task_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable("Task was removed before result loading".to_string())
+        })?;
     if !completed.response_format_zip {
         let response_started_at = Instant::now();
         let mut payload = serde_json::to_value(&status_payload)?;
@@ -116,6 +124,7 @@ pub(crate) async fn file_parse(
             &mut payload,
             ResultBuilder::build_json_payload(&completed).await?,
         );
+        drop(result_lease);
         tracing::debug!(
             %task_id,
             response_format = "json",
@@ -127,9 +136,13 @@ pub(crate) async fn file_parse(
     }
 
     let response_started_at = Instant::now();
-    let mut response =
-        ResultBuilder::build_response(&completed, StatusCode::OK, &format!("{task_id}.zip"))
-            .await?;
+    let mut response = ResultBuilder::build_response_with_lease(
+        &completed,
+        StatusCode::OK,
+        &format!("{task_id}.zip"),
+        Some(result_lease),
+    )
+    .await?;
     response.headers_mut().insert(
         FILE_PARSE_TASK_ID_HEADER,
         task_id.to_string().parse().expect("uuid header is valid"),
@@ -178,10 +191,11 @@ pub(crate) async fn submit_task(
     multipart: Multipart,
 ) -> ApiResult<Response> {
     let base_url = base_url_from_headers(&headers);
+    let admission_permit = acquire_admission_permit(&state).await?;
     let task = create_async_parse_task(&state, multipart).await?;
     let task_manager = state.task_manager();
     let payload = task_manager.status_payload(&task, &base_url).await;
-    spawn_task_processor(state, task);
+    spawn_task_processor(state, task, admission_permit);
     Ok((
         StatusCode::ACCEPTED,
         Json(with_message(payload, "Task submitted successfully")),
@@ -244,7 +258,19 @@ pub(crate) async fn get_task_result(
         )
             .into_response());
     }
-    ResultBuilder::build_response(&task, StatusCode::OK, &format!("{task_id}.zip")).await
+    let result_lease = task_manager
+        .acquire_result_lease(task_id)
+        .await
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable("Task was removed before result loading".to_string())
+        })?;
+    ResultBuilder::build_response_with_lease(
+        &task,
+        StatusCode::OK,
+        &format!("{task_id}.zip"),
+        Some(result_lease),
+    )
+    .await
 }
 
 #[utoipa::path(
@@ -263,12 +289,23 @@ pub(crate) async fn health(State(state): State<AppState>) -> ApiResult<Json<Heal
         completed_tasks: stats.completed,
         failed_tasks: stats.failed,
         max_concurrent_requests: state.config().max_concurrent_requests,
+        max_in_flight_tasks: state.config().max_in_flight_tasks,
+        available_admission_permits: state.available_admission_permits(),
         max_upload_size_bytes: state.config().max_upload_size_bytes,
         processing_window_size: state.config().processing_window_size,
         vlm_max_concurrency: state.config().vlm_max_concurrency,
+        available_vlm_permits: state.available_vlm_permits(),
         task_retention_seconds: state.config().task_retention.as_secs(),
         task_cleanup_interval_seconds: state.config().task_cleanup_interval.as_secs(),
     }))
+}
+
+async fn acquire_admission_permit(state: &AppState) -> ApiResult<OwnedSemaphorePermit> {
+    state
+        .admission_semaphore()
+        .acquire_owned()
+        .await
+        .map_err(|error| ApiError::ServiceUnavailable(error.to_string()))
 }
 
 async fn create_async_parse_task(state: &AppState, multipart: Multipart) -> ApiResult<ParseTask> {
@@ -365,8 +402,9 @@ fn parse_usize(value: &str, name: &str) -> ApiResult<usize> {
         .map_err(|_| ApiError::BadRequest(format!("Invalid integer value for {name}: {value}")))
 }
 
-fn spawn_task_processor(state: AppState, task: ParseTask) {
+fn spawn_task_processor(state: AppState, task: ParseTask, admission_permit: OwnedSemaphorePermit) {
     tokio::spawn(async move {
+        let _admission_permit = admission_permit;
         let task_id = task.task_id;
         let queue_started_at = Instant::now();
         let permit = match state.request_semaphore().acquire_owned().await {
@@ -453,8 +491,16 @@ fn merge_object_fields(target: &mut Value, source: Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_form_field, parse_bool};
-    use crate::domain::models::ParseOptions;
+    use std::time::Duration;
+
+    use crate::{
+        config::CliArgs,
+        domain::models::ParseOptions,
+        server::state::AppState,
+        vlm::test_env::{EnvVarGuard, TEST_ENV_LOCK},
+    };
+
+    use super::{acquire_admission_permit, apply_form_field, parse_bool};
 
     #[test]
     fn parses_boolean_values() {
@@ -480,5 +526,40 @@ mod tests {
         options.normalize_backend_alias();
         assert_eq!(options.backend, "vlm-http-client");
         assert!(options.validate().is_ok());
+    }
+
+    #[tokio::test]
+    async fn admission_permit_waits_until_capacity_is_released() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let temp = tempfile::tempdir().expect("tempdir should be created");
+        let _output_root = EnvVarGuard::set(
+            "MINERU_API_OUTPUT_ROOT",
+            temp.path().to_str().unwrap_or_default(),
+        );
+        let _in_flight = EnvVarGuard::set("MINERU_API_MAX_IN_FLIGHT_TASKS", "1");
+        let state = AppState::new(CliArgs {
+            host: "127.0.0.1".to_string(),
+            port: 34000,
+            allow_public_http_client: false,
+        })
+        .await
+        .expect("state should build");
+
+        let first = acquire_admission_permit(&state)
+            .await
+            .expect("first permit should acquire");
+        assert_eq!(state.available_admission_permits(), 0);
+
+        let waiting = acquire_admission_permit(&state);
+        assert!(tokio::time::timeout(Duration::from_millis(20), waiting)
+            .await
+            .is_err());
+
+        drop(first);
+        let second = acquire_admission_permit(&state)
+            .await
+            .expect("second permit should acquire after release");
+        drop(second);
+        assert_eq!(state.available_admission_permits(), 1);
     }
 }

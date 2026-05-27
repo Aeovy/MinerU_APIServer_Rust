@@ -6,8 +6,8 @@ pub const API_PROTOCOL_VERSION: u8 = 1;
 pub const MINERU_VERSION: &str = "3.1.15";
 pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 3;
 pub const DEFAULT_MAX_UPLOAD_SIZE_BYTES: usize = 256 * 1024 * 1024;
-pub const DEFAULT_PROCESSING_WINDOW_SIZE: usize = 64;
-pub const DEFAULT_VLM_MAX_CONCURRENCY: usize = 100;
+pub const DEFAULT_PROCESSING_WINDOW_SIZE: usize = 8;
+pub const DEFAULT_VLM_MAX_CONCURRENCY: usize = 32;
 pub const DEFAULT_IMAGE_PREPROCESS_THREADS: usize = 0;
 pub const DEFAULT_TASK_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS: u64 = 5 * 60;
@@ -34,6 +34,7 @@ pub struct ServiceConfig {
     pub allow_public_http_client: bool,
     pub output_root: PathBuf,
     pub max_concurrent_requests: usize,
+    pub max_in_flight_tasks: usize,
     pub max_upload_size_bytes: usize,
     pub processing_window_size: usize,
     pub vlm_max_concurrency: usize,
@@ -56,6 +57,11 @@ impl ServiceConfig {
         let max_concurrent_requests = read_usize_env(
             "MINERU_API_MAX_CONCURRENT_REQUESTS",
             default_max_concurrent_requests,
+            1,
+        );
+        let max_in_flight_tasks = read_usize_env(
+            "MINERU_API_MAX_IN_FLIGHT_TASKS",
+            max_concurrent_requests.saturating_mul(2).max(1),
             1,
         );
         let max_upload_size_bytes = read_usize_env(
@@ -94,6 +100,7 @@ impl ServiceConfig {
             allow_public_http_client: args.allow_public_http_client,
             output_root,
             max_concurrent_requests,
+            max_in_flight_tasks,
             max_upload_size_bytes,
             processing_window_size,
             vlm_max_concurrency,
@@ -174,7 +181,8 @@ fn available_parallelism() -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_public_bind_host, CliArgs, DEFAULT_MAX_UPLOAD_SIZE_BYTES, DEFAULT_VLM_MAX_CONCURRENCY,
+        is_public_bind_host, CliArgs, DEFAULT_MAX_UPLOAD_SIZE_BYTES,
+        DEFAULT_PROCESSING_WINDOW_SIZE, DEFAULT_VLM_MAX_CONCURRENCY,
     };
     use crate::vlm::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
@@ -211,6 +219,38 @@ mod tests {
         assert_eq!(
             super::ServiceConfig::from_args(&args).vlm_max_concurrency,
             7
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_resource_guard_defaults_and_overrides() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let args = CliArgs {
+            host: "127.0.0.1".to_string(),
+            port: 34000,
+            allow_public_http_client: false,
+        };
+
+        let _window = EnvVarGuard::unset("MINERU_PROCESSING_WINDOW_SIZE");
+        let _requests = EnvVarGuard::set("MINERU_API_MAX_CONCURRENT_REQUESTS", "3");
+        let _in_flight = EnvVarGuard::unset("MINERU_API_MAX_IN_FLIGHT_TASKS");
+        let config = super::ServiceConfig::from_args(&args);
+        assert_eq!(
+            config.processing_window_size,
+            DEFAULT_PROCESSING_WINDOW_SIZE
+        );
+        assert_eq!(config.max_in_flight_tasks, 6);
+
+        let _window = EnvVarGuard::set("MINERU_PROCESSING_WINDOW_SIZE", "5");
+        let _in_flight = EnvVarGuard::set("MINERU_API_MAX_IN_FLIGHT_TASKS", "9");
+        let config = super::ServiceConfig::from_args(&args);
+        assert_eq!(config.processing_window_size, 5);
+        assert_eq!(config.max_in_flight_tasks, 9);
+
+        let _in_flight = EnvVarGuard::set("MINERU_API_MAX_IN_FLIGHT_TASKS", "0");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).max_in_flight_tasks,
+            6
         );
     }
 

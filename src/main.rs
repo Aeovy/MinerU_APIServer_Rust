@@ -37,6 +37,7 @@ async fn main() -> anyhow::Result<()> {
         local_addr = %local_addr,
         output_root = %config.output_root.display(),
         max_concurrent_requests = config.max_concurrent_requests,
+        max_in_flight_tasks = config.max_in_flight_tasks,
         max_upload_size_bytes = config.max_upload_size_bytes,
         processing_window_size = config.processing_window_size,
         vlm_max_concurrency = config.vlm_max_concurrency,

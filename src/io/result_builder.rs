@@ -20,7 +20,7 @@ use tokio::{fs, sync::mpsc};
 
 use crate::{
     config::MINERU_VERSION,
-    domain::models::ParseTask,
+    domain::{models::ParseTask, tasks::ResultReadLease},
     error::{ApiError, ApiResult},
 };
 
@@ -34,16 +34,18 @@ const ZIP_STREAM_CHUNK_SIZE: usize = 64 * 1024;
 pub struct ResultBuilder;
 
 impl ResultBuilder {
-    /// Build a JSON or ZIP HTTP response for a completed parse task.
+    /// Build a result response while optionally keeping the task output directory leased.
     ///
     /// Inputs:
     /// - `task`: completed task metadata and return flags.
     /// - `status_code`: HTTP response status to use.
     /// - `zip_filename`: download filename when ZIP output is requested.
-    pub async fn build_response(
+    /// - `lease`: active result read lease held through JSON loading or ZIP streaming.
+    pub async fn build_response_with_lease(
         task: &ParseTask,
         status_code: StatusCode,
         zip_filename: &str,
+        lease: Option<ResultReadLease>,
     ) -> ApiResult<Response<Body>> {
         let started_at = Instant::now();
         if task.response_format_zip {
@@ -54,7 +56,7 @@ impl ResultBuilder {
                     header::CONTENT_DISPOSITION,
                     format!("attachment; filename=\"{zip_filename}\""),
                 )
-                .body(build_zip_stream(task))
+                .body(build_zip_stream(task, lease))
                 .map_err(|error| ApiError::Internal(error.to_string()))?;
             tracing::debug!(
                 task_id = %task.task_id,
@@ -67,6 +69,7 @@ impl ResultBuilder {
         }
 
         let payload = Self::build_json_payload(task).await?;
+        drop(lease);
         tracing::debug!(
             task_id = %task.task_id,
             file_count = task.file_names.len(),
@@ -104,6 +107,7 @@ async fn build_result_dict(task: &ParseTask) -> ApiResult<Value> {
         let file_started_at = Instant::now();
         let parse_dir = task.output_dir.join(file_name).join("vlm");
         let mut data = Map::new();
+        let mut image_count = 0_usize;
         if task.return_md {
             data.insert(
                 "md_content".to_string(),
@@ -129,20 +133,22 @@ async fn build_result_dict(task: &ParseTask) -> ApiResult<Value> {
             );
         }
         if task.return_images {
-            data.insert(
-                "images".to_string(),
-                read_images(&parse_dir.join("images")).await?,
-            );
+            let images = read_images(&parse_dir.join("images")).await?;
+            image_count = images.as_object().map(Map::len).unwrap_or_default();
+            data.insert("images".to_string(), images);
         }
+        let returned_field_count = data.len();
         results.insert(file_name.clone(), Value::Object(data));
         tracing::debug!(
             task_id = %task.task_id,
             file_name,
+            returned_field_count,
             return_md = task.return_md,
             return_middle_json = task.return_middle_json,
             return_model_output = task.return_model_output,
             return_content_list = task.return_content_list,
             return_images = task.return_images,
+            image_count,
             elapsed_ms = file_started_at.elapsed().as_millis(),
             "json result file loaded"
         );
@@ -156,10 +162,11 @@ async fn build_result_dict(task: &ParseTask) -> ApiResult<Value> {
     Ok(Value::Object(results))
 }
 
-fn build_zip_stream(task: &ParseTask) -> Body {
+fn build_zip_stream(task: &ParseTask, lease: Option<ResultReadLease>) -> Body {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(ZIP_STREAM_CHANNEL_CAPACITY);
     let task = task.clone();
     tokio::task::spawn_blocking(move || {
+        let _lease = lease;
         let started_at = Instant::now();
         let result = build_zip_to_writer(&task, ChannelZipWriter::new(sender.clone()));
         tracing::debug!(
@@ -667,9 +674,10 @@ mod tests {
             .expect("png fixture");
         let task = completed_zip_task(temp.path().to_path_buf(), upload_path);
 
-        let response = ResultBuilder::build_response(&task, StatusCode::OK, "sample.zip")
-            .await
-            .expect("zip response");
+        let response =
+            ResultBuilder::build_response_with_lease(&task, StatusCode::OK, "sample.zip", None)
+                .await
+                .expect("zip response");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
@@ -708,7 +716,13 @@ mod tests {
                 get(move || {
                     let task = task.clone();
                     async move {
-                        ResultBuilder::build_response(&task, StatusCode::OK, "sample.zip").await
+                        ResultBuilder::build_response_with_lease(
+                            &task,
+                            StatusCode::OK,
+                            "sample.zip",
+                            None,
+                        )
+                        .await
                     }
                 }),
             )
