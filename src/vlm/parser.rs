@@ -12,7 +12,6 @@ use fast_image_resize::{
 use futures::{stream, StreamExt};
 use image::{imageops, DynamicImage, GenericImageView, ImageFormat, Rgba};
 use pdfium_render::prelude::*;
-use rayon::prelude::*;
 use tokio::{fs, sync::Semaphore};
 
 use crate::{
@@ -88,6 +87,17 @@ struct PageLayoutResult {
     blocks: Vec<ContentBlock>,
 }
 
+struct PagePipelineResult {
+    page: PageParseResult,
+    block_count: usize,
+    extract_job_count: usize,
+    layout_prepare_ms: u128,
+    layout_vlm_ms: u128,
+    prepare_blocks_ms: u128,
+    extract_ms: u128,
+    apply_results_ms: u128,
+}
+
 struct BlockExtractJob {
     page_index: usize,
     block_index: usize,
@@ -97,7 +107,6 @@ struct BlockExtractJob {
 }
 
 struct BlockExtractResult {
-    page_index: usize,
     block_index: usize,
     content: String,
     image_png: Option<Vec<u8>>,
@@ -336,7 +345,7 @@ impl VlmDocumentParser {
         Ok(document)
     }
 
-    /// Parse one rendered page window as layout, block preparation, and block extraction stages.
+    /// Parse one rendered page window with page-level pipelining.
     ///
     /// Inputs:
     /// - `task`: request options and output directory.
@@ -358,80 +367,63 @@ impl VlmDocumentParser {
             last_page,
             "page window parse started"
         );
-        let layout_started_at = Instant::now();
         let limiter = self.vlm_semaphore.clone();
-        let prepared_pages =
-            prepare_window_layout_images_async(self.image_preprocess_pool.clone(), pages).await?;
-        let mut layouts = self
-            .detect_window_layouts(task, session, prepared_pages, limiter.clone())
-            .await?;
-        layouts.sort_by_key(|layout| layout.page_index);
-        let layout_elapsed_ms = layout_started_at.elapsed().as_millis();
-
-        let prepare_started_at = Instant::now();
-        let block_count = layouts
-            .iter()
-            .map(|layout| layout.blocks.len())
-            .sum::<usize>();
-        let jobs = prepare_window_extract_jobs_async(
-            self.image_preprocess_pool.clone(),
-            task.image_analysis,
-            &layouts,
+        let page_concurrency = page_count.min(self.vlm_max_concurrency).max(1);
+        let mut pipeline_results = Vec::with_capacity(page_count);
+        let mut pending = stream::iter(
+            pages
+                .into_iter()
+                .map(|page| self.parse_one_page_pipeline(task, session, page, limiter.clone())),
         )
-        .await?;
-        let job_count = jobs.len();
-        tracing::debug!(
-            task_id = %task.task_id,
-            page_count,
-            first_page,
-            last_page,
-            block_count,
-            extract_job_count = job_count,
-            layout_ms = layout_elapsed_ms,
-            prepare_blocks_ms = prepare_started_at.elapsed().as_millis(),
-            "page window layout completed"
-        );
+        .buffer_unordered(page_concurrency);
 
-        let extract_started_at = Instant::now();
-        let mut extracts = self
-            .extract_window_blocks(task, session, jobs, limiter.clone())
-            .await?;
-        extracts.sort_by_key(|result| (result.page_index, result.block_index));
-        let extract_elapsed_ms = extract_started_at.elapsed().as_millis();
-
-        let apply_started_at = Instant::now();
-        for result in extracts {
-            if let Some(layout) = layouts
-                .iter_mut()
-                .find(|layout| layout.page_index == result.page_index)
-            {
-                if !result.content.is_empty() {
-                    layout.blocks[result.block_index].content = Some(result.content);
-                }
-                if let Some(image_png) = result.image_png {
-                    self.write_result_image_bytes(
-                        task,
-                        result.page_index,
-                        result.block_index,
-                        &image_png,
-                    )
-                    .await?;
+        while let Some(result) = pending.next().await {
+            match result {
+                Ok(page) => pipeline_results.push(page),
+                Err(error) => {
+                    tracing::debug!(
+                        task_id = %task.task_id,
+                        error = %error.detail(),
+                        completed_page_count = pipeline_results.len(),
+                        "page pipeline failed; cancelling remaining window pages"
+                    );
+                    return Err(error);
                 }
             }
         }
-        let apply_elapsed_ms = apply_started_at.elapsed().as_millis();
+        pipeline_results.sort_by_key(|result| result.page.page_index);
+        let block_count = pipeline_results
+            .iter()
+            .map(|result| result.block_count)
+            .sum::<usize>();
+        let extract_job_count = pipeline_results
+            .iter()
+            .map(|result| result.extract_job_count)
+            .sum::<usize>();
+        let layout_prepare_ms = pipeline_results
+            .iter()
+            .map(|result| result.layout_prepare_ms)
+            .sum::<u128>();
+        let layout_vlm_ms = pipeline_results
+            .iter()
+            .map(|result| result.layout_vlm_ms)
+            .sum::<u128>();
+        let prepare_blocks_ms = pipeline_results
+            .iter()
+            .map(|result| result.prepare_blocks_ms)
+            .sum::<u128>();
+        let extract_ms = pipeline_results
+            .iter()
+            .map(|result| result.extract_ms)
+            .sum::<u128>();
+        let apply_results_ms = pipeline_results
+            .iter()
+            .map(|result| result.apply_results_ms)
+            .sum::<u128>();
 
-        let results = layouts
+        let results = pipeline_results
             .into_iter()
-            .map(|layout| PageParseResult {
-                page_index: layout.page_index,
-                page_width: layout.page_width,
-                page_height: layout.page_height,
-                point_width: layout.point_width,
-                point_height: layout.point_height,
-                page_image: layout.page_image,
-                blocks: layout.blocks,
-            })
+            .map(|result| result.page)
             .collect::<Vec<_>>();
         tracing::debug!(
             task_id = %task.task_id,
@@ -439,14 +431,105 @@ impl VlmDocumentParser {
             first_page,
             last_page,
             block_count,
-            extract_job_count = job_count,
-            layout_ms = layout_elapsed_ms,
-            extract_ms = extract_elapsed_ms,
-            apply_results_ms = apply_elapsed_ms,
+            extract_job_count,
+            layout_prepare_ms,
+            layout_vlm_ms,
+            prepare_blocks_ms,
+            extract_ms,
+            apply_results_ms,
             elapsed_ms = started_at.elapsed().as_millis(),
             "page window parse completed"
         );
         Ok(results)
+    }
+
+    /// Parse one page through layout detection, block crop preparation, and block extraction.
+    ///
+    /// Inputs:
+    /// - `task`: request options and output directory.
+    /// - `page`: one rendered PDF page or uploaded image page.
+    /// - `limiter`: global VLM request limiter shared by all documents.
+    async fn parse_one_page_pipeline(
+        &self,
+        task: &ParseTask,
+        session: &VlmSession,
+        page: RenderedPage,
+        limiter: Arc<Semaphore>,
+    ) -> ApiResult<PagePipelineResult> {
+        let started_at = Instant::now();
+        let page_index = page.page_index;
+
+        let prepared_page =
+            prepare_page_layout_image_async(self.image_preprocess_pool.clone(), page).await?;
+        let layout_prepare_ms = prepared_page.prepare_ms;
+        let layout_started_at = Instant::now();
+        let mut layout = self
+            .detect_page_layout(task, session, prepared_page, limiter.clone())
+            .await?;
+        let layout_vlm_ms = layout_started_at.elapsed().as_millis();
+
+        let prepare_blocks_started_at = Instant::now();
+        let jobs = prepare_page_extract_jobs_async(
+            self.image_preprocess_pool.clone(),
+            task.image_analysis,
+            &layout,
+        )
+        .await?;
+        let block_count = layout.blocks.len();
+        let extract_job_count = jobs.len();
+        let prepare_blocks_ms = prepare_blocks_started_at.elapsed().as_millis();
+
+        let extract_started_at = Instant::now();
+        let mut extracts = self
+            .extract_window_blocks(task, session, jobs, limiter.clone())
+            .await?;
+        extracts.sort_by_key(|result| result.block_index);
+        let extract_ms = extract_started_at.elapsed().as_millis();
+
+        let apply_started_at = Instant::now();
+        for result in extracts {
+            if !result.content.is_empty() {
+                layout.blocks[result.block_index].content = Some(result.content);
+            }
+            if let Some(image_png) = result.image_png {
+                self.write_result_image_bytes(task, page_index, result.block_index, &image_png)
+                    .await?;
+            }
+        }
+        let apply_results_ms = apply_started_at.elapsed().as_millis();
+
+        tracing::debug!(
+            task_id = %task.task_id,
+            page_index,
+            block_count,
+            extract_job_count,
+            layout_prepare_ms,
+            layout_vlm_ms,
+            prepare_blocks_ms,
+            extract_ms,
+            apply_results_ms,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "page pipeline completed"
+        );
+
+        Ok(PagePipelineResult {
+            page: PageParseResult {
+                page_index: layout.page_index,
+                page_width: layout.page_width,
+                page_height: layout.page_height,
+                point_width: layout.point_width,
+                point_height: layout.point_height,
+                page_image: layout.page_image,
+                blocks: layout.blocks,
+            },
+            block_count,
+            extract_job_count,
+            layout_prepare_ms,
+            layout_vlm_ms,
+            prepare_blocks_ms,
+            extract_ms,
+            apply_results_ms,
+        })
     }
 
     /// Run MinerU layout detection for one rendered page.
@@ -510,41 +593,6 @@ impl VlmDocumentParser {
         })
     }
 
-    /// Detect layouts for a prepared page window and fail fast on the first VLM error.
-    ///
-    /// Inputs:
-    /// - `prepared_pages`: rendered pages plus layout PNG bytes already prepared on the CPU pool.
-    /// - `limiter`: global VLM request limiter shared by all documents.
-    async fn detect_window_layouts(
-        &self,
-        task: &ParseTask,
-        session: &VlmSession,
-        prepared_pages: Vec<PreparedLayoutPage>,
-        limiter: Arc<Semaphore>,
-    ) -> ApiResult<Vec<PageLayoutResult>> {
-        let mut layouts = Vec::with_capacity(prepared_pages.len());
-        let concurrency = prepared_pages.len().min(self.vlm_max_concurrency).max(1);
-        let mut pending = stream::iter(prepared_pages.into_iter().map(|prepared_page| {
-            self.detect_page_layout(task, session, prepared_page, limiter.clone())
-        }))
-        .buffer_unordered(concurrency);
-
-        while let Some(result) = pending.next().await {
-            match result {
-                Ok(layout) => layouts.push(layout),
-                Err(error) => {
-                    tracing::debug!(
-                        error = %error.detail(),
-                        completed_layout_count = layouts.len(),
-                        "page layout detection failed; cancelling remaining window requests"
-                    );
-                    return Err(error);
-                }
-            }
-        }
-        Ok(layouts)
-    }
-
     /// Send one block crop to the VLM backend and preserve optional image bytes.
     ///
     /// Inputs:
@@ -591,7 +639,6 @@ impl VlmDocumentParser {
             "block extracted"
         );
         Ok(BlockExtractResult {
-            page_index,
             block_index,
             content,
             image_png: result_image_png,
@@ -785,62 +832,48 @@ fn normalize_image_preprocess_threads(threads: usize) -> usize {
     threads.clamp(1, MAX_IMAGE_PREPROCESS_THREADS)
 }
 
-/// Prepare all layout detection PNGs for one rendered window on the image thread pool.
+/// Prepare one page layout detection PNG on the image thread pool.
 ///
 /// Inputs:
 /// - `pool`: shared CPU pool for resize and PNG encode work.
-/// - `pages`: rendered PDF or image pages in one processing window.
-async fn prepare_window_layout_images_async(
+/// - `page`: rendered PDF or image page.
+async fn prepare_page_layout_image_async(
     pool: Arc<rayon::ThreadPool>,
-    pages: Vec<RenderedPage>,
-) -> ApiResult<Vec<PreparedLayoutPage>> {
+    page: RenderedPage,
+) -> ApiResult<PreparedLayoutPage> {
     tokio::task::spawn_blocking(move || {
         pool.install(|| {
-            pages
-                .into_par_iter()
-                .map(|page| {
-                    let started_at = Instant::now();
-                    let image_png = encode_png(&prepare_layout_image(&page.image)?)?;
-                    Ok(PreparedLayoutPage {
-                        page,
-                        image_png,
-                        prepare_ms: started_at.elapsed().as_millis(),
-                    })
-                })
-                .collect::<ApiResult<Vec<_>>>()
+            let started_at = Instant::now();
+            let image_png = encode_png(&prepare_layout_image(&page.image)?)?;
+            Ok(PreparedLayoutPage {
+                page,
+                image_png,
+                prepare_ms: started_at.elapsed().as_millis(),
+            })
         })
     })
     .await
     .map_err(|error| ApiError::Internal(error.to_string()))?
 }
 
-/// Prepare all block extraction jobs for one rendered window on the image thread pool.
+/// Prepare block extraction jobs for one laid-out page on the image thread pool.
 ///
 /// Inputs:
 /// - `pool`: shared CPU pool for crop, resize, and PNG encode work.
 /// - `image_analysis`: request option controlling skipped image/chart blocks.
-/// - `layouts`: ordered page layouts with source page images.
-async fn prepare_window_extract_jobs_async(
+/// - `layout`: page layout with source page image.
+async fn prepare_page_extract_jobs_async(
     pool: Arc<rayon::ThreadPool>,
     image_analysis: bool,
-    layouts: &[PageLayoutResult],
+    layout: &PageLayoutResult,
 ) -> ApiResult<Vec<BlockExtractJob>> {
-    let layout_inputs = layouts
-        .iter()
-        .map(|layout| PageExtractInput {
-            page_index: layout.page_index,
-            page_image: layout.page_image.clone(),
-            blocks: layout.blocks.clone(),
-        })
-        .collect::<Vec<_>>();
+    let layout_input = PageExtractInput {
+        page_index: layout.page_index,
+        page_image: layout.page_image.clone(),
+        blocks: layout.blocks.clone(),
+    };
     tokio::task::spawn_blocking(move || {
-        pool.install(|| {
-            layout_inputs
-                .into_par_iter()
-                .map(|layout| prepare_block_extract_jobs(image_analysis, layout))
-                .collect::<ApiResult<Vec<Vec<BlockExtractJob>>>>()
-                .map(|page_jobs| page_jobs.into_iter().flatten().collect())
-        })
+        pool.install(|| prepare_block_extract_jobs(image_analysis, layout_input))
     })
     .await
     .map_err(|error| ApiError::Internal(error.to_string()))?
@@ -1204,7 +1237,7 @@ fn skip_extract_types(image_analysis: bool) -> HashSet<&'static str> {
 mod tests {
     use std::{
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
         time::Duration,
@@ -1232,6 +1265,8 @@ mod tests {
         text_chat_count: Arc<AtomicUsize>,
         active_layouts: Arc<AtomicUsize>,
         max_active_layouts: Arc<AtomicUsize>,
+        completed_layouts: Arc<AtomicUsize>,
+        text_before_all_layouts_completed: Arc<AtomicBool>,
         fail_layout_once: bool,
         fail_chat: bool,
     }
@@ -1282,14 +1317,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepares_window_extract_jobs_with_stable_order() {
+    async fn prepares_page_extract_jobs_with_stable_order() {
         let pool = Arc::new(
             rayon::ThreadPoolBuilder::new()
                 .num_threads(2)
                 .build()
                 .expect("pool builds"),
         );
-        let layouts = vec![super::PageLayoutResult {
+        let layout = super::PageLayoutResult {
             page_index: 2,
             page_width: 20,
             page_height: 20,
@@ -1316,9 +1351,9 @@ mod tests {
                     merge_prev: None,
                 },
             ],
-        }];
+        };
 
-        let jobs = super::prepare_window_extract_jobs_async(pool, true, &layouts)
+        let jobs = super::prepare_page_extract_jobs_async(pool, true, &layout)
             .await
             .expect("jobs prepare");
 
@@ -1363,7 +1398,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn page_window_runs_layouts_before_window_block_extraction() {
+    async fn page_window_starts_page_blocks_before_all_layouts_finish() {
         let _env_lock = TEST_ENV_LOCK.lock().await;
         let _no_proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1,localhost");
         let (base_url, state, server) = spawn_test_vlm_server(false).await;
@@ -1407,6 +1442,12 @@ mod tests {
         assert_eq!(state.models_count.load(Ordering::SeqCst), 1);
         assert_eq!(state.chat_count.load(Ordering::SeqCst), 4);
         assert_eq!(state.max_active_layouts.load(Ordering::SeqCst), 2);
+        assert!(
+            state
+                .text_before_all_layouts_completed
+                .load(Ordering::SeqCst),
+            "first page block extraction should start before the whole window layout stage finishes"
+        );
         assert!(results
             .iter()
             .all(|result| result.blocks[0].content.as_deref() == Some("recognized text")));
@@ -1527,6 +1568,8 @@ mod tests {
             text_chat_count: Arc::new(AtomicUsize::new(0)),
             active_layouts: Arc::new(AtomicUsize::new(0)),
             max_active_layouts: Arc::new(AtomicUsize::new(0)),
+            completed_layouts: Arc::new(AtomicUsize::new(0)),
+            text_before_all_layouts_completed: Arc::new(AtomicBool::new(false)),
             fail_layout_once: false,
             fail_chat,
         };
@@ -1560,6 +1603,8 @@ mod tests {
             text_chat_count: Arc::new(AtomicUsize::new(0)),
             active_layouts: Arc::new(AtomicUsize::new(0)),
             max_active_layouts: Arc::new(AtomicUsize::new(0)),
+            completed_layouts: Arc::new(AtomicUsize::new(0)),
+            text_before_all_layouts_completed: Arc::new(AtomicBool::new(false)),
             fail_layout_once: true,
             fail_chat: false,
         };
@@ -1622,7 +1667,7 @@ mod tests {
         }
         let prompt = extract_prompt_text(&payload);
         if prompt.contains("Layout Detection") {
-            state.layout_chat_count.fetch_add(1, Ordering::SeqCst);
+            let layout_call = state.layout_chat_count.fetch_add(1, Ordering::SeqCst) + 1;
             if state.fail_layout_once {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -1631,8 +1676,10 @@ mod tests {
             }
             let active = state.active_layouts.fetch_add(1, Ordering::SeqCst) + 1;
             state.max_active_layouts.fetch_max(active, Ordering::SeqCst);
-            sleep(Duration::from_millis(100)).await;
+            let layout_delay_ms = if layout_call == 1 { 20 } else { 150 };
+            sleep(Duration::from_millis(layout_delay_ms)).await;
             state.active_layouts.fetch_sub(1, Ordering::SeqCst);
+            state.completed_layouts.fetch_add(1, Ordering::SeqCst);
             return (
                 StatusCode::OK,
                 Json(chat_payload(
@@ -1641,6 +1688,11 @@ mod tests {
             );
         }
         state.text_chat_count.fetch_add(1, Ordering::SeqCst);
+        if state.completed_layouts.load(Ordering::SeqCst) < 2 {
+            state
+                .text_before_all_layouts_completed
+                .store(true, Ordering::SeqCst);
+        }
         (StatusCode::OK, Json(chat_payload("recognized text")))
     }
 
