@@ -9,7 +9,7 @@
 target/*
 !target/release
 target/release/*
-!target/release/mineru
+!target/release/mineru-rust
 output
 
 *.log

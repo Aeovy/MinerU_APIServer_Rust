@@ -3,6 +3,10 @@ name = "mineru"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "mineru-rust"
+path = "src/main.rs"
+
 [features]
 default = ["jemalloc"]
 jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
