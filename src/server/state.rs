@@ -6,7 +6,7 @@ use crate::{
     config::{CliArgs, ServiceConfig},
     domain::tasks::TaskManager,
     error::{ApiError, ApiResult},
-    vlm::{client::VlmHttpClient, parser::VlmDocumentParser},
+    vlm::{client::VlmHttpClient, parser::VlmDocumentParser, scheduler::VlmRequestScheduler},
 };
 
 #[derive(Clone)]
@@ -18,6 +18,7 @@ pub struct AppStateInner {
     pub config: ServiceConfig,
     pub task_manager: Arc<TaskManager>,
     pub parser: Arc<VlmDocumentParser>,
+    pub vlm_scheduler: Arc<VlmRequestScheduler>,
     pub admission_semaphore: Arc<Semaphore>,
     pub request_semaphore: Arc<Semaphore>,
 }
@@ -34,10 +35,17 @@ impl AppState {
             .map_err(ApiError::from)?;
         let task_manager = Arc::new(TaskManager::new(config.task_retention));
         let client = Arc::new(VlmHttpClient::new());
-        let parser = Arc::new(VlmDocumentParser::new(
+        let vlm_scheduler = VlmRequestScheduler::new(
+            client.clone(),
+            config.vlm_max_concurrency,
+            config.vlm_queue_capacity,
+        );
+        let parser = Arc::new(VlmDocumentParser::with_scheduler(
             client,
+            vlm_scheduler.clone(),
             config.processing_window_size,
             config.vlm_max_concurrency,
+            config.max_vlm_requests_per_task,
             config.image_preprocess_threads,
         )?);
         let admission_semaphore = Arc::new(Semaphore::new(config.max_in_flight_tasks));
@@ -47,6 +55,7 @@ impl AppState {
                 config,
                 task_manager,
                 parser,
+                vlm_scheduler,
                 admission_semaphore,
                 request_semaphore,
             }),
@@ -67,6 +76,10 @@ impl AppState {
         self.inner.parser.clone()
     }
 
+    pub fn vlm_scheduler(&self) -> Arc<VlmRequestScheduler> {
+        self.inner.vlm_scheduler.clone()
+    }
+
     pub fn admission_semaphore(&self) -> Arc<Semaphore> {
         self.inner.admission_semaphore.clone()
     }
@@ -76,7 +89,7 @@ impl AppState {
     }
 
     pub fn available_vlm_permits(&self) -> usize {
-        self.inner.parser.available_vlm_permits()
+        self.inner.vlm_scheduler.available_permits()
     }
 
     pub fn request_semaphore(&self) -> Arc<Semaphore> {

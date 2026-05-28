@@ -1,6 +1,7 @@
 pub mod client;
 pub mod parser;
 pub mod python_compat;
+pub mod scheduler;
 
 #[cfg(test)]
 pub(crate) mod test_env {

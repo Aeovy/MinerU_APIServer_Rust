@@ -43,6 +43,8 @@ async fn main() -> anyhow::Result<()> {
         max_upload_size_bytes = config.max_upload_size_bytes,
         processing_window_size = config.processing_window_size,
         vlm_max_concurrency = config.vlm_max_concurrency,
+        vlm_queue_capacity = config.vlm_queue_capacity,
+        max_vlm_requests_per_task = config.max_vlm_requests_per_task,
         image_preprocess_threads = config.image_preprocess_threads,
         memory_reclaim_after_task = config.memory_reclaim_after_task,
         public_bind_exposed = config.public_bind_exposed,

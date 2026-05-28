@@ -68,3 +68,14 @@ MINERU_API_OUTPUT_ROOT=/app/output
 运行时 `--env-file .env` 会覆盖镜像内默认环境变量；也可以继续用 `-e KEY=value` 覆盖 `.env` 中的单项配置。
 
 程序启动时也会尝试读取当前工作目录下的 `.env`，但 Docker 推荐使用 `--env-file` 传入环境变量，而不是把 `.env` 复制进镜像。
+
+## VLM 并发调优
+
+服务端使用全局 VLM worker 队列调度所有解析任务的 VLM 请求：
+
+- `MINERU_VLM_MAX_CONCURRENCY`: 全局同时发送到 VLM 服务的请求数。
+- `MINERU_VLM_QUEUE_CAPACITY`: 等待 VLM worker 的有界队列容量。
+- `MINERU_VLM_MAX_REQUESTS_PER_TASK`: 单个任务同时排队/发送的 VLM 请求上限，防止大文档独占队列。
+- `MINERU_API_MAX_CONCURRENT_REQUESTS`: 同时进入解析执行态的文档数。排队文件很多但 VLM 不满载时，可以在内存允许的前提下提高到 8-16。
+
+可通过 `/health` 观察 `active_vlm_requests`、`vlm_queue_depth`、`vlm_queue_capacity` 和 `available_vlm_permits` 判断瓶颈。如果 `active_vlm_requests` 长期低于 `MINERU_VLM_MAX_CONCURRENCY` 且队列为空，通常说明 PDF 渲染、图片裁剪或解析任务数不足；如果队列长期接近满，说明 VLM 服务本身是瓶颈。

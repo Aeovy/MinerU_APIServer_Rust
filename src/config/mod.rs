@@ -8,6 +8,8 @@ pub const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 3;
 pub const DEFAULT_MAX_UPLOAD_SIZE_BYTES: usize = 256 * 1024 * 1024;
 pub const DEFAULT_PROCESSING_WINDOW_SIZE: usize = 8;
 pub const DEFAULT_VLM_MAX_CONCURRENCY: usize = 50;
+pub const DEFAULT_VLM_QUEUE_CAPACITY_MULTIPLIER: usize = 4;
+pub const DEFAULT_VLM_MAX_REQUESTS_PER_TASK_CEILING: usize = 8;
 pub const DEFAULT_IMAGE_PREPROCESS_THREADS: usize = 0;
 pub const DEFAULT_MEMORY_RECLAIM_AFTER_TASK: bool = true;
 pub const DEFAULT_TASK_RETENTION_SECONDS: u64 = 24 * 60 * 60;
@@ -39,6 +41,8 @@ pub struct ServiceConfig {
     pub max_upload_size_bytes: usize,
     pub processing_window_size: usize,
     pub vlm_max_concurrency: usize,
+    pub vlm_queue_capacity: usize,
+    pub max_vlm_requests_per_task: usize,
     pub image_preprocess_threads: usize,
     pub memory_reclaim_after_task: bool,
     pub task_retention: Duration,
@@ -78,6 +82,22 @@ impl ServiceConfig {
         );
         let vlm_max_concurrency =
             read_usize_env("MINERU_VLM_MAX_CONCURRENCY", DEFAULT_VLM_MAX_CONCURRENCY, 1);
+        let vlm_queue_capacity = read_usize_env(
+            "MINERU_VLM_QUEUE_CAPACITY",
+            vlm_max_concurrency
+                .saturating_mul(DEFAULT_VLM_QUEUE_CAPACITY_MULTIPLIER)
+                .max(1),
+            1,
+        );
+        let max_vlm_requests_per_task = read_usize_env(
+            "MINERU_VLM_MAX_REQUESTS_PER_TASK",
+            vlm_max_concurrency
+                .min(DEFAULT_VLM_MAX_REQUESTS_PER_TASK_CEILING)
+                .max(1),
+            1,
+        )
+        .min(vlm_max_concurrency)
+        .max(1);
         let image_preprocess_threads = read_usize_env(
             "MINERU_IMAGE_PREPROCESS_THREADS",
             default_image_preprocess_threads(),
@@ -110,6 +130,8 @@ impl ServiceConfig {
             max_upload_size_bytes,
             processing_window_size,
             vlm_max_concurrency,
+            vlm_queue_capacity,
+            max_vlm_requests_per_task,
             image_preprocess_threads,
             memory_reclaim_after_task,
             task_retention,
@@ -209,7 +231,8 @@ mod tests {
     use super::{
         is_public_bind_host, CliArgs, DEFAULT_MAX_UPLOAD_SIZE_BYTES,
         DEFAULT_MEMORY_RECLAIM_AFTER_TASK, DEFAULT_PROCESSING_WINDOW_SIZE,
-        DEFAULT_VLM_MAX_CONCURRENCY,
+        DEFAULT_VLM_MAX_CONCURRENCY, DEFAULT_VLM_MAX_REQUESTS_PER_TASK_CEILING,
+        DEFAULT_VLM_QUEUE_CAPACITY_MULTIPLIER,
     };
     use crate::vlm::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
@@ -247,6 +270,35 @@ mod tests {
             super::ServiceConfig::from_args(&args).vlm_max_concurrency,
             7
         );
+    }
+
+    #[tokio::test]
+    async fn reads_vlm_scheduler_defaults_and_overrides() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let args = CliArgs {
+            host: "127.0.0.1".to_string(),
+            port: 34000,
+            allow_public_http_client: false,
+        };
+
+        let _concurrency = EnvVarGuard::set("MINERU_VLM_MAX_CONCURRENCY", "12");
+        let _queue = EnvVarGuard::unset("MINERU_VLM_QUEUE_CAPACITY");
+        let _task = EnvVarGuard::unset("MINERU_VLM_MAX_REQUESTS_PER_TASK");
+        let config = super::ServiceConfig::from_args(&args);
+        assert_eq!(
+            config.vlm_queue_capacity,
+            12 * DEFAULT_VLM_QUEUE_CAPACITY_MULTIPLIER
+        );
+        assert_eq!(
+            config.max_vlm_requests_per_task,
+            DEFAULT_VLM_MAX_REQUESTS_PER_TASK_CEILING
+        );
+
+        let _queue = EnvVarGuard::set("MINERU_VLM_QUEUE_CAPACITY", "5");
+        let _task = EnvVarGuard::set("MINERU_VLM_MAX_REQUESTS_PER_TASK", "99");
+        let config = super::ServiceConfig::from_args(&args);
+        assert_eq!(config.vlm_queue_capacity, 5);
+        assert_eq!(config.max_vlm_requests_per_task, 12);
     }
 
     #[tokio::test]

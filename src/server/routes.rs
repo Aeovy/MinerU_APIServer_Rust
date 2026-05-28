@@ -281,6 +281,7 @@ pub(crate) async fn get_task_result(
 )]
 pub(crate) async fn health(State(state): State<AppState>) -> ApiResult<Json<HealthPayload>> {
     let stats = state.task_manager().stats().await;
+    let vlm_stats = state.vlm_scheduler().stats();
     let allocator_stats = memory::allocator_stats();
     Ok(Json(HealthPayload {
         status: "healthy".to_string(),
@@ -297,6 +298,10 @@ pub(crate) async fn health(State(state): State<AppState>) -> ApiResult<Json<Heal
         processing_window_size: state.config().processing_window_size,
         vlm_max_concurrency: state.config().vlm_max_concurrency,
         available_vlm_permits: state.available_vlm_permits(),
+        vlm_queue_depth: vlm_stats.queue_depth,
+        active_vlm_requests: vlm_stats.active_requests,
+        vlm_queue_capacity: vlm_stats.queue_capacity,
+        max_vlm_requests_per_task: state.config().max_vlm_requests_per_task,
         allocator_allocated_bytes: allocator_stats.map(|stats| stats.allocated_bytes),
         allocator_resident_bytes: allocator_stats.map(|stats| stats.resident_bytes),
         allocator_retained_bytes: allocator_stats.map(|stats| stats.retained_bytes),
