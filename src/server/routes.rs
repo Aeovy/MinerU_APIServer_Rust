@@ -33,6 +33,7 @@ use crate::{
         },
         uploads::{uniquify_upload_stems, UploadStore},
     },
+    memory,
     server::{openapi::ApiDoc, security::validate_public_http_client_policy, state::AppState},
 };
 
@@ -280,6 +281,7 @@ pub(crate) async fn get_task_result(
 )]
 pub(crate) async fn health(State(state): State<AppState>) -> ApiResult<Json<HealthPayload>> {
     let stats = state.task_manager().stats().await;
+    let allocator_stats = memory::allocator_stats();
     Ok(Json(HealthPayload {
         status: "healthy".to_string(),
         version: MINERU_VERSION.to_string(),
@@ -295,6 +297,9 @@ pub(crate) async fn health(State(state): State<AppState>) -> ApiResult<Json<Heal
         processing_window_size: state.config().processing_window_size,
         vlm_max_concurrency: state.config().vlm_max_concurrency,
         available_vlm_permits: state.available_vlm_permits(),
+        allocator_allocated_bytes: allocator_stats.map(|stats| stats.allocated_bytes),
+        allocator_resident_bytes: allocator_stats.map(|stats| stats.resident_bytes),
+        allocator_retained_bytes: allocator_stats.map(|stats| stats.retained_bytes),
         task_retention_seconds: state.config().task_retention.as_secs(),
         task_cleanup_interval_seconds: state.config().task_cleanup_interval.as_secs(),
     }))
@@ -414,6 +419,7 @@ fn spawn_task_processor(state: AppState, task: ParseTask, admission_permit: Owne
                     .task_manager()
                     .set_failed(task_id, error.to_string())
                     .await;
+                memory::reclaim_after_task(task_id, state.config().memory_reclaim_after_task);
                 return;
             }
         };
@@ -453,6 +459,7 @@ fn spawn_task_processor(state: AppState, task: ParseTask, admission_permit: Owne
                     .await
             }
         }
+        memory::reclaim_after_task(task_id, state.config().memory_reclaim_after_task);
     });
 }
 

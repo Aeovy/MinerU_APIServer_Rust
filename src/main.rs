@@ -2,6 +2,7 @@ mod config;
 mod domain;
 mod error;
 mod io;
+mod memory;
 mod server;
 mod vlm;
 
@@ -43,6 +44,7 @@ async fn main() -> anyhow::Result<()> {
         processing_window_size = config.processing_window_size,
         vlm_max_concurrency = config.vlm_max_concurrency,
         image_preprocess_threads = config.image_preprocess_threads,
+        memory_reclaim_after_task = config.memory_reclaim_after_task,
         public_bind_exposed = config.public_bind_exposed,
         allow_public_http_client = config.allow_public_http_client,
         "MinerU API server started"

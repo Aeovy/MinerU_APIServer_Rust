@@ -9,6 +9,7 @@ pub const DEFAULT_MAX_UPLOAD_SIZE_BYTES: usize = 256 * 1024 * 1024;
 pub const DEFAULT_PROCESSING_WINDOW_SIZE: usize = 8;
 pub const DEFAULT_VLM_MAX_CONCURRENCY: usize = 32;
 pub const DEFAULT_IMAGE_PREPROCESS_THREADS: usize = 0;
+pub const DEFAULT_MEMORY_RECLAIM_AFTER_TASK: bool = true;
 pub const DEFAULT_TASK_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 pub const DEFAULT_TASK_CLEANUP_INTERVAL_SECONDS: u64 = 5 * 60;
 pub const DEFAULT_OUTPUT_ROOT: &str = "./output";
@@ -39,6 +40,7 @@ pub struct ServiceConfig {
     pub processing_window_size: usize,
     pub vlm_max_concurrency: usize,
     pub image_preprocess_threads: usize,
+    pub memory_reclaim_after_task: bool,
     pub task_retention: Duration,
     pub task_cleanup_interval: Duration,
 }
@@ -81,6 +83,10 @@ impl ServiceConfig {
             default_image_preprocess_threads(),
             1,
         );
+        let memory_reclaim_after_task = read_bool_env(
+            "MINERU_MEMORY_RECLAIM_AFTER_TASK",
+            DEFAULT_MEMORY_RECLAIM_AFTER_TASK,
+        );
         let task_retention = Duration::from_secs(read_u64_env(
             "MINERU_API_TASK_RETENTION_SECONDS",
             DEFAULT_TASK_RETENTION_SECONDS,
@@ -105,6 +111,7 @@ impl ServiceConfig {
             processing_window_size,
             vlm_max_concurrency,
             image_preprocess_threads,
+            memory_reclaim_after_task,
             task_retention,
             task_cleanup_interval,
         }
@@ -130,6 +137,25 @@ fn read_usize_env(name: &str, default: usize, minimum: usize) -> usize {
 
 fn read_u64_env(name: &str, default: u64, minimum: u64) -> u64 {
     read_parsed_env(name, default, minimum)
+}
+
+fn read_bool_env(name: &str, default: bool) -> bool {
+    let Ok(raw) = env::var(name) else {
+        return default;
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => true,
+        "false" | "0" | "no" | "off" => false,
+        value => {
+            tracing::warn!(
+                name,
+                value,
+                default,
+                "invalid boolean environment value; using default"
+            );
+            default
+        }
+    }
 }
 
 fn read_parsed_env<T>(name: &str, default: T, minimum: T) -> T
@@ -182,7 +208,8 @@ fn available_parallelism() -> usize {
 mod tests {
     use super::{
         is_public_bind_host, CliArgs, DEFAULT_MAX_UPLOAD_SIZE_BYTES,
-        DEFAULT_PROCESSING_WINDOW_SIZE, DEFAULT_VLM_MAX_CONCURRENCY,
+        DEFAULT_MEMORY_RECLAIM_AFTER_TASK, DEFAULT_PROCESSING_WINDOW_SIZE,
+        DEFAULT_VLM_MAX_CONCURRENCY,
     };
     use crate::vlm::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
@@ -251,6 +278,31 @@ mod tests {
         assert_eq!(
             super::ServiceConfig::from_args(&args).max_in_flight_tasks,
             6
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_memory_reclaim_after_task_default_and_override() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let args = CliArgs {
+            host: "127.0.0.1".to_string(),
+            port: 34000,
+            allow_public_http_client: false,
+        };
+
+        let _value = EnvVarGuard::unset("MINERU_MEMORY_RECLAIM_AFTER_TASK");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).memory_reclaim_after_task,
+            DEFAULT_MEMORY_RECLAIM_AFTER_TASK
+        );
+
+        let _value = EnvVarGuard::set("MINERU_MEMORY_RECLAIM_AFTER_TASK", "false");
+        assert!(!super::ServiceConfig::from_args(&args).memory_reclaim_after_task);
+
+        let _value = EnvVarGuard::set("MINERU_MEMORY_RECLAIM_AFTER_TASK", "invalid");
+        assert_eq!(
+            super::ServiceConfig::from_args(&args).memory_reclaim_after_task,
+            DEFAULT_MEMORY_RECLAIM_AFTER_TASK
         );
     }
 

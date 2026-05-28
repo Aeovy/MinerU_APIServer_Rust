@@ -23,7 +23,10 @@ use super::client::{
     layout_prompt, layout_sampling_params, prompt_for_block, sampling_params_for_block,
     VlmHttpClient, VlmRequest, VlmSession,
 };
-use super::python_compat::{DocumentOutputAccumulator, PythonPageInput};
+use super::python_compat::{
+    build_page_output_fragment, DocumentOutputAccumulator, PythonPageInput,
+    PythonPageOutputFragment,
+};
 
 const DEFAULT_PDF_IMAGE_DPI: f32 = 200.0;
 const LAYOUT_IMAGE_SIZE: u32 = 1036;
@@ -38,30 +41,6 @@ pub struct VlmDocumentParser {
     vlm_max_concurrency: usize,
     vlm_semaphore: Arc<Semaphore>,
     image_preprocess_pool: Arc<rayon::ThreadPool>,
-}
-
-struct PageParseResult {
-    page_index: usize,
-    page_width: u32,
-    page_height: u32,
-    point_width: u32,
-    point_height: u32,
-    page_image: Arc<DynamicImage>,
-    blocks: Vec<ContentBlock>,
-}
-
-impl PageParseResult {
-    fn into_python_input(self) -> PythonPageInput {
-        PythonPageInput {
-            page_index: self.page_index,
-            page_width: self.page_width,
-            page_height: self.page_height,
-            point_width: self.point_width,
-            point_height: self.point_height,
-            image: self.page_image,
-            blocks: self.blocks,
-        }
-    }
 }
 
 struct RenderedPage {
@@ -88,7 +67,7 @@ struct PageLayoutResult {
 }
 
 struct PagePipelineResult {
-    page: PageParseResult,
+    page: PythonPageOutputFragment,
     block_count: usize,
     extract_job_count: usize,
     layout_prepare_ms: u128,
@@ -220,21 +199,22 @@ impl VlmDocumentParser {
         );
 
         if upload.suffix == "pdf" {
-            let read_started_at = Instant::now();
-            let bytes = Arc::<[u8]>::from(fs::read(&upload.path).await?);
+            let metadata_started_at = Instant::now();
+            let pdf_path = upload.path.clone();
+            let pdf_byte_len = fs::metadata(&pdf_path).await?.len();
             tracing::debug!(
                 task_id = %task.task_id,
                 file_name = %upload.stem,
-                byte_len = bytes.len(),
-                elapsed_ms = read_started_at.elapsed().as_millis(),
-                "pdf bytes loaded"
+                byte_len = pdf_byte_len,
+                elapsed_ms = metadata_started_at.elapsed().as_millis(),
+                "pdf file ready for windowed rendering"
             );
             let mut next_page_id = task.start_page_id;
             loop {
                 let render_started_at = Instant::now();
                 let requested_start_page = next_page_id;
                 let window = self
-                    .load_pdf_page_window(bytes.clone(), next_page_id, task.end_page_id)
+                    .load_pdf_page_window(pdf_path.clone(), next_page_id, task.end_page_id)
                     .await?;
                 let render_elapsed_ms = render_started_at.elapsed().as_millis();
                 if window.pages.is_empty() {
@@ -262,17 +242,11 @@ impl VlmDocumentParser {
                     "pdf page window rendered"
                 );
                 let parse_window_started_at = Instant::now();
-                let page_results = self.parse_page_window(task, &session, window.pages).await?;
-                page_count += page_results.len();
-                output_builder
-                    .append_pages(
-                        page_results
-                            .into_iter()
-                            .map(PageParseResult::into_python_input)
-                            .collect(),
-                        &pending_image_dir,
-                    )
+                let page_fragments = self
+                    .parse_page_window(task, &session, window.pages, pending_image_dir.clone())
                     .await?;
+                page_count += page_fragments.len();
+                output_builder.append_fragments(page_fragments);
                 tracing::debug!(
                     task_id = %task.task_id,
                     file_name = %upload.stem,
@@ -297,17 +271,11 @@ impl VlmDocumentParser {
                 "image pages loaded"
             );
             let parse_window_started_at = Instant::now();
-            let page_results = self.parse_page_window(task, &session, pages).await?;
-            page_count += page_results.len();
-            output_builder
-                .append_pages(
-                    page_results
-                        .into_iter()
-                        .map(PageParseResult::into_python_input)
-                        .collect(),
-                    &pending_image_dir,
-                )
+            let page_fragments = self
+                .parse_page_window(task, &session, pages, pending_image_dir.clone())
                 .await?;
+            page_count += page_fragments.len();
+            output_builder.append_fragments(page_fragments);
             tracing::debug!(
                 task_id = %task.task_id,
                 file_name = %upload.stem,
@@ -350,12 +318,14 @@ impl VlmDocumentParser {
     /// Inputs:
     /// - `task`: request options and output directory.
     /// - `pages`: rendered page images in one processing window.
+    /// - `pending_image_dir`: temporary crop directory used by Python-compatible output.
     async fn parse_page_window(
         &self,
         task: &ParseTask,
         session: &VlmSession,
         pages: Vec<RenderedPage>,
-    ) -> ApiResult<Vec<PageParseResult>> {
+        pending_image_dir: PathBuf,
+    ) -> ApiResult<Vec<PythonPageOutputFragment>> {
         let started_at = Instant::now();
         let page_count = pages.len();
         let first_page = pages.first().map(|page| page.page_index);
@@ -367,14 +337,19 @@ impl VlmDocumentParser {
             last_page,
             "page window parse started"
         );
+        fs::create_dir_all(&pending_image_dir).await?;
         let limiter = self.vlm_semaphore.clone();
         let page_concurrency = page_count.min(self.vlm_max_concurrency).max(1);
         let mut pipeline_results = Vec::with_capacity(page_count);
-        let mut pending = stream::iter(
-            pages
-                .into_iter()
-                .map(|page| self.parse_one_page_pipeline(task, session, page, limiter.clone())),
-        )
+        let mut pending = stream::iter(pages.into_iter().map(|page| {
+            self.parse_one_page_pipeline(
+                task,
+                session,
+                page,
+                limiter.clone(),
+                pending_image_dir.clone(),
+            )
+        }))
         .buffer_unordered(page_concurrency);
 
         while let Some(result) = pending.next().await {
@@ -391,7 +366,7 @@ impl VlmDocumentParser {
                 }
             }
         }
-        pipeline_results.sort_by_key(|result| result.page.page_index);
+        pipeline_results.sort_by_key(|result| result.page.page_index());
         let block_count = pipeline_results
             .iter()
             .map(|result| result.block_count)
@@ -449,12 +424,14 @@ impl VlmDocumentParser {
     /// - `task`: request options and output directory.
     /// - `page`: one rendered PDF page or uploaded image page.
     /// - `limiter`: global VLM request limiter shared by all documents.
+    /// - `pending_image_dir`: temporary crop directory used by Python-compatible output.
     async fn parse_one_page_pipeline(
         &self,
         task: &ParseTask,
         session: &VlmSession,
         page: RenderedPage,
         limiter: Arc<Semaphore>,
+        pending_image_dir: PathBuf,
     ) -> ApiResult<PagePipelineResult> {
         let started_at = Instant::now();
         let page_index = page.page_index;
@@ -497,6 +474,21 @@ impl VlmDocumentParser {
             }
         }
         let apply_results_ms = apply_started_at.elapsed().as_millis();
+        let output_started_at = Instant::now();
+        let page_fragment = build_page_output_fragment(
+            PythonPageInput {
+                page_index: layout.page_index,
+                page_width: layout.page_width,
+                page_height: layout.page_height,
+                point_width: layout.point_width,
+                point_height: layout.point_height,
+                image: layout.page_image,
+                blocks: layout.blocks,
+            },
+            &pending_image_dir,
+        )
+        .await?;
+        let output_fragment_ms = output_started_at.elapsed().as_millis();
 
         tracing::debug!(
             task_id = %task.task_id,
@@ -508,20 +500,13 @@ impl VlmDocumentParser {
             prepare_blocks_ms,
             extract_ms,
             apply_results_ms,
+            output_fragment_ms,
             elapsed_ms = started_at.elapsed().as_millis(),
             "page pipeline completed"
         );
 
         Ok(PagePipelineResult {
-            page: PageParseResult {
-                page_index: layout.page_index,
-                page_width: layout.page_width,
-                page_height: layout.page_height,
-                point_width: layout.point_width,
-                point_height: layout.point_height,
-                page_image: layout.page_image,
-                blocks: layout.blocks,
-            },
+            page: page_fragment,
             block_count,
             extract_job_count,
             layout_prepare_ms,
@@ -799,14 +784,14 @@ impl VlmDocumentParser {
 
     async fn load_pdf_page_window(
         &self,
-        bytes: Arc<[u8]>,
+        path: PathBuf,
         start_page_id: usize,
         end_page_id: usize,
     ) -> ApiResult<RenderedPageWindow> {
         let window_size = self.processing_window_size.max(1);
         let started_at = Instant::now();
         tokio::task::spawn_blocking(move || {
-            render_pdf_page_window(&bytes, start_page_id, end_page_id, window_size)
+            render_pdf_page_window(&path, start_page_id, end_page_id, window_size)
         })
         .await
         .map_err(|error| ApiError::Internal(error.to_string()))?
@@ -976,14 +961,14 @@ fn split_layout_segments(output: &str) -> Vec<String> {
 }
 
 fn render_pdf_page_window(
-    bytes: &[u8],
+    path: &Path,
     start_page_id: usize,
     end_page_id: usize,
     processing_window_size: usize,
 ) -> ApiResult<RenderedPageWindow> {
     let pdfium = bind_pdfium()?;
     let document = pdfium
-        .load_pdf_from_byte_slice(bytes, None)
+        .load_pdf_from_file(path, None)
         .map_err(|error| ApiError::BadRequest(format!("Failed to open PDF: {error}")))?;
     let page_count = document.pages().len() as usize;
     let Some((start, window_end, next_page_id)) = pdf_page_window_bounds(
@@ -1246,6 +1231,7 @@ mod tests {
     use axum::{extract::State, http::StatusCode, routing::get, routing::post, Json, Router};
     use chrono::Utc;
     use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
+    use printpdf::{Mm, PdfDocument, PdfPage, PdfSaveOptions};
     use serde_json::{json, Value};
     use tempfile::tempdir;
     use tokio::{net::TcpListener, sync::oneshot, time::sleep};
@@ -1253,6 +1239,7 @@ mod tests {
 
     use crate::domain::models::{ParseOptions, ParseTask, StoredUpload, TaskStatus};
     use crate::vlm::client::VlmHttpClient;
+    use crate::vlm::python_compat::DocumentOutputAccumulator;
     use crate::vlm::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     use super::{bind_pdfium, parse_layout_output, VlmDocumentParser};
@@ -1314,6 +1301,30 @@ mod tests {
         );
         assert_eq!(super::pdf_page_window_bounds(11, 11, 99999, 64), None);
         assert_eq!(super::pdf_page_window_bounds(11, 12, 99999, 64), None);
+    }
+
+    #[tokio::test]
+    async fn pdf_page_window_loads_from_file_path() {
+        let temp = tempdir().expect("temp dir");
+        let pdf_path = temp.path().join("sample.pdf");
+        let mut warnings = Vec::new();
+        let pdf_bytes = PdfDocument::new("path render test")
+            .with_pages(vec![PdfPage::new(Mm(10.0), Mm(10.0), Vec::new())])
+            .save(&PdfSaveOptions::default(), &mut warnings);
+        tokio::fs::write(&pdf_path, pdf_bytes)
+            .await
+            .expect("pdf fixture should write");
+        let parser =
+            VlmDocumentParser::new(Arc::new(VlmHttpClient::new()), 4, 4, 2).expect("parser builds");
+
+        let window = parser
+            .load_pdf_page_window(pdf_path, 0, 99999)
+            .await
+            .expect("pdf window should render");
+
+        assert_eq!(window.pages.len(), 1);
+        assert_eq!(window.pages[0].page_index, 0);
+        assert_eq!(window.next_page_id, 1);
     }
 
     #[tokio::test]
@@ -1427,7 +1438,7 @@ mod tests {
         ];
 
         let results = parser
-            .parse_page_window(&task, &session, pages)
+            .parse_page_window(&task, &session, pages, temp.path().join("_pending_images"))
             .await
             .expect("window parse succeeds");
 
@@ -1435,7 +1446,7 @@ mod tests {
         assert_eq!(
             results
                 .iter()
-                .map(|result| result.page_index)
+                .map(|result| result.page_index())
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
@@ -1448,9 +1459,10 @@ mod tests {
                 .load(Ordering::SeqCst),
             "first page block extraction should start before the whole window layout stage finishes"
         );
-        assert!(results
-            .iter()
-            .all(|result| result.blocks[0].content.as_deref() == Some("recognized text")));
+        let mut builder = DocumentOutputAccumulator::new();
+        builder.append_fragments(results);
+        let output = builder.finish();
+        assert!(output.markdown.contains("recognized text"));
     }
 
     #[tokio::test]
@@ -1478,10 +1490,18 @@ mod tests {
             .expect("session should resolve");
         let parser = VlmDocumentParser::new(client, 2, 1, 2).expect("parser builds");
 
-        let first =
-            parser.parse_page_window(&task, &session, vec![rendered_test_page(0, [1, 2, 3])]);
-        let second =
-            parser.parse_page_window(&task, &session, vec![rendered_test_page(1, [4, 5, 6])]);
+        let first = parser.parse_page_window(
+            &task,
+            &session,
+            vec![rendered_test_page(0, [1, 2, 3])],
+            temp.path().join("_pending_images_1"),
+        );
+        let second = parser.parse_page_window(
+            &task,
+            &session,
+            vec![rendered_test_page(1, [4, 5, 6])],
+            temp.path().join("_pending_images_2"),
+        );
         let (first, second) = tokio::join!(first, second);
 
         server.abort();
@@ -1542,7 +1562,9 @@ mod tests {
             rendered_test_page(1, [0, 255, 0]),
         ];
 
-        let result = parser.parse_page_window(&task, &session, pages).await;
+        let result = parser
+            .parse_page_window(&task, &session, pages, temp.path().join("_pending_images"))
+            .await;
         let error = match result {
             Ok(_) => panic!("layout error should fail the window"),
             Err(error) => error,

@@ -238,6 +238,9 @@ pub struct HealthPayload {
     pub processing_window_size: usize,
     pub vlm_max_concurrency: usize,
     pub available_vlm_permits: usize,
+    pub allocator_allocated_bytes: Option<usize>,
+    pub allocator_resident_bytes: Option<usize>,
+    pub allocator_retained_bytes: Option<usize>,
     pub task_retention_seconds: u64,
     pub task_cleanup_interval_seconds: u64,
 }

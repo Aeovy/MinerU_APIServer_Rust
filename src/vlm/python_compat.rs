@@ -37,6 +37,20 @@ pub struct PythonDocumentOutput {
     pub image_files: Vec<PathBuf>,
 }
 
+#[derive(Debug)]
+pub struct PythonPageOutputFragment {
+    page_index: usize,
+    page_info: PageInfo,
+    model_output_page: Value,
+    image_files: Vec<PathBuf>,
+}
+
+impl PythonPageOutputFragment {
+    pub fn page_index(&self) -> usize {
+        self.page_index
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct DocumentOutputAccumulator {
     pdf_info: Vec<PageInfo>,
@@ -54,27 +68,33 @@ impl DocumentOutputAccumulator {
     /// Inputs:
     /// - `pages`: parsed page images and raw VLM blocks for one processing window.
     /// - `pending_image_dir`: temporary directory for Python-style cropped JPEG assets.
+    #[cfg(test)]
     pub async fn append_pages(
         &mut self,
         pages: Vec<PythonPageInput>,
         pending_image_dir: &Path,
     ) -> ApiResult<()> {
         fs::create_dir_all(pending_image_dir).await?;
-
-        for mut page in pages {
-            let processed_blocks = post_process_raw_blocks(std::mem::take(&mut page.blocks));
-            self.model_output_pages.push(Value::Array(
-                processed_blocks.iter().map(model_block_to_json).collect(),
-            ));
-
-            let (mut page_info, mut page_image_files) =
-                build_page_info(&page, &processed_blocks, pending_image_dir).await?;
-            finalize_page_info(&mut page_info);
-            self.pdf_info.push(page_info);
-            self.image_files.append(&mut page_image_files);
+        let mut fragments = Vec::with_capacity(pages.len());
+        for page in pages {
+            fragments.push(build_page_output_fragment(page, pending_image_dir).await?);
         }
+        self.append_fragments(fragments);
 
         Ok(())
+    }
+
+    /// Append already materialized page output fragments without retaining page images.
+    ///
+    /// Inputs:
+    /// - `fragments`: page output built by the page-level parser pipeline.
+    pub fn append_fragments(&mut self, fragments: Vec<PythonPageOutputFragment>) {
+        for mut fragment in fragments {
+            self.model_output_pages
+                .push(std::mem::take(&mut fragment.model_output_page));
+            self.pdf_info.push(fragment.page_info);
+            self.image_files.append(&mut fragment.image_files);
+        }
     }
 
     /// Finalize accumulated page state into the existing MinerU-compatible document output.
@@ -96,6 +116,30 @@ impl DocumentOutputAccumulator {
             image_files: self.image_files,
         }
     }
+}
+
+/// Build one lightweight page fragment and release the source page image before returning.
+///
+/// Inputs:
+/// - `page`: parsed page image and raw VLM blocks.
+/// - `pending_image_dir`: temporary directory for Python-style cropped JPEG assets.
+pub async fn build_page_output_fragment(
+    mut page: PythonPageInput,
+    pending_image_dir: &Path,
+) -> ApiResult<PythonPageOutputFragment> {
+    fs::create_dir_all(pending_image_dir).await?;
+    let processed_blocks = post_process_raw_blocks(std::mem::take(&mut page.blocks));
+    let model_output_page =
+        Value::Array(processed_blocks.iter().map(model_block_to_json).collect());
+    let (mut page_info, image_files) =
+        build_page_info(&page, &processed_blocks, pending_image_dir).await?;
+    finalize_page_info(&mut page_info);
+    Ok(PythonPageOutputFragment {
+        page_index: page.page_index,
+        page_info,
+        model_output_page,
+        image_files,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1627,6 +1671,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn page_fragments_match_append_pages_output() {
+        let pages = vec![test_page_input(0, "alpha"), test_page_input(1, "beta")];
+        let append_temp = tempfile::tempdir().expect("append tempdir should be created");
+        let fragment_temp = tempfile::tempdir().expect("fragment tempdir should be created");
+
+        let mut append_builder = DocumentOutputAccumulator::new();
+        append_builder
+            .append_pages(pages.clone(), append_temp.path())
+            .await
+            .expect("append_pages should build");
+
+        let mut fragments = Vec::new();
+        for page in pages {
+            fragments.push(
+                build_page_output_fragment(page, fragment_temp.path())
+                    .await
+                    .expect("page fragment should build"),
+            );
+        }
+        let mut fragment_builder = DocumentOutputAccumulator::new();
+        fragment_builder.append_fragments(fragments);
+
+        let append_output = append_builder.finish();
+        let fragment_output = fragment_builder.finish();
+        assert_eq!(append_output.markdown, fragment_output.markdown);
+        assert_eq!(append_output.middle_json, fragment_output.middle_json);
+        assert_eq!(append_output.model_output, fragment_output.model_output);
+        assert_eq!(append_output.content_list, fragment_output.content_list);
+        assert_eq!(
+            append_output.content_list_v2,
+            fragment_output.content_list_v2
+        );
+    }
+
     fn load_fixture_pages(path: &Path) -> Vec<PythonPageInput> {
         let model: Value =
             serde_json::from_slice(&std::fs::read(path).expect("model fixture should read"))
@@ -1655,6 +1734,24 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    fn test_page_input(page_index: usize, content: &str) -> PythonPageInput {
+        PythonPageInput {
+            page_index,
+            page_width: 100,
+            page_height: 100,
+            point_width: 100,
+            point_height: 100,
+            image: Arc::new(DynamicImage::ImageRgb8(RgbImage::new(100, 100))),
+            blocks: vec![ContentBlock {
+                block_type: "text".to_string(),
+                bbox: [0.0, 0.0, 1.0, 1.0],
+                angle: None,
+                content: Some(content.to_string()),
+                merge_prev: None,
+            }],
+        }
     }
 
     fn json_to_content_block(value: &Value) -> ContentBlock {
