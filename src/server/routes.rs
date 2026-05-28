@@ -34,7 +34,10 @@ use crate::{
         uploads::{uniquify_upload_stems, UploadStore},
     },
     memory,
-    server::{openapi::ApiDoc, security::validate_public_http_client_policy, state::AppState},
+    server::{
+        health_page::health_page, openapi::ApiDoc, security::validate_public_http_client_policy,
+        state::AppState,
+    },
 };
 
 pub fn build_router(state: AppState) -> Router {
@@ -45,6 +48,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/tasks/{task_id}", get(get_task_status))
         .route("/tasks/{task_id}/result", get(get_task_result))
         .route("/health", get(health))
+        .route("/health/ui", get(health_page))
         .merge(SwaggerUi::new("/docs").url("/openapi.json", ApiDoc::openapi()))
         .layer(
             TraceLayer::new_for_http()

@@ -55,6 +55,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(url = %format!("{base_url}/docs"), "API documentation");
     tracing::info!(url = %format!("{base_url}/openapi.json"), "OpenAPI schema");
     tracing::info!(url = %format!("{base_url}/health"), "Health check");
+    tracing::info!(url = %format!("{base_url}/health/ui"), "Health dashboard");
 
     axum::serve(listener, app)
         .await
