@@ -30,6 +30,9 @@ pub const FILE_PARSE_TASK_STATUS_URL_HEADER: &str = "X-MinerU-Task-Status-Url";
 pub const FILE_PARSE_TASK_RESULT_URL_HEADER: &str = "X-MinerU-Task-Result-Url";
 const ZIP_STREAM_CHANNEL_CAPACITY: usize = 8;
 const ZIP_STREAM_CHUNK_SIZE: usize = 64 * 1024;
+const ZIP_FLAG_DATA_DESCRIPTOR: u16 = 0x0008;
+const ZIP_FLAG_UTF8_NAMES: u16 = 0x0800;
+const ZIP_GENERAL_PURPOSE_FLAGS: u16 = ZIP_FLAG_DATA_DESCRIPTOR | ZIP_FLAG_UTF8_NAMES;
 
 pub struct ResultBuilder;
 
@@ -420,7 +423,7 @@ impl<W: Write> StreamingZipWriter<W> {
     fn write_local_header(&mut self, name: &[u8]) -> ApiResult<()> {
         self.write_u32(0x0403_4b50)?;
         self.write_u16(20)?;
-        self.write_u16(0x08)?;
+        self.write_u16(ZIP_GENERAL_PURPOSE_FLAGS)?;
         self.write_u16(0)?;
         self.write_u16(0)?;
         self.write_u16(0)?;
@@ -453,7 +456,7 @@ impl<W: Write> StreamingZipWriter<W> {
         self.write_u32(0x0201_4b50)?;
         self.write_u16(20)?;
         self.write_u16(20)?;
-        self.write_u16(0x08)?;
+        self.write_u16(ZIP_GENERAL_PURPOSE_FLAGS)?;
         self.write_u16(0)?;
         self.write_u16(0)?;
         self.write_u16(0)?;
@@ -641,7 +644,10 @@ mod tests {
 
     use crate::domain::models::{ParseTask, TaskStatus};
 
-    use super::{build_zip, ResultBuilder};
+    use super::{
+        build_zip, ResultBuilder, ZIP_FLAG_DATA_DESCRIPTOR, ZIP_FLAG_UTF8_NAMES,
+        ZIP_GENERAL_PURPOSE_FLAGS,
+    };
 
     #[tokio::test]
     async fn image_original_is_zipped_as_pdf() {
@@ -702,6 +708,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zip_entries_preserve_chinese_file_names() {
+        let temp = tempdir().expect("temp dir");
+        let file_name = "解析测试文档";
+        let parse_dir = temp.path().join(file_name).join("vlm");
+        tokio::fs::create_dir_all(&parse_dir)
+            .await
+            .expect("parse dir should be created");
+        tokio::fs::write(parse_dir.join(format!("{file_name}.md")), "# ok\n")
+            .await
+            .expect("markdown should write");
+        let mut task = completed_zip_task(temp.path().to_path_buf(), temp.path().join("noop.pdf"));
+        task.file_names = vec![file_name.to_string()];
+        task.return_md = true;
+        task.return_original_file = false;
+
+        let bytes = build_zip(&task).await.expect("zip bytes");
+        assert_zip_utf8_flags(&bytes);
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("zip archive");
+        let mut markdown = archive
+            .by_name("解析测试文档/vlm/解析测试文档.md")
+            .expect("utf-8 zip entry should be readable by name");
+        let mut content = String::new();
+        markdown
+            .read_to_string(&mut content)
+            .expect("markdown should read");
+
+        assert_eq!(content, "# ok\n");
+    }
+
+    #[tokio::test]
     async fn zip_response_is_not_http_gzip_compressed() {
         let temp = tempdir().expect("temp dir");
         let upload_path = temp.path().join("sample.png");
@@ -752,6 +788,23 @@ mod tests {
             .expect("response body should read");
         assert!(bytes.starts_with(b"PK\x03\x04"));
         assert!(!bytes.starts_with(&[0x1f, 0x8b, 0x08]));
+    }
+
+    fn assert_zip_utf8_flags(bytes: &[u8]) {
+        let local_flags = u16::from_le_bytes([bytes[6], bytes[7]]);
+        assert_eq!(local_flags, ZIP_GENERAL_PURPOSE_FLAGS);
+        assert_ne!(local_flags & ZIP_FLAG_DATA_DESCRIPTOR, 0);
+        assert_ne!(local_flags & ZIP_FLAG_UTF8_NAMES, 0);
+
+        let central_offset = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x01\x02")
+            .expect("central directory header should exist");
+        let central_flags =
+            u16::from_le_bytes([bytes[central_offset + 8], bytes[central_offset + 9]]);
+        assert_eq!(central_flags, ZIP_GENERAL_PURPOSE_FLAGS);
+        assert_ne!(central_flags & ZIP_FLAG_DATA_DESCRIPTOR, 0);
+        assert_ne!(central_flags & ZIP_FLAG_UTF8_NAMES, 0);
     }
 
     fn completed_zip_task(

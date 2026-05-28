@@ -204,6 +204,14 @@ mod tests {
     }
 
     #[test]
+    fn preserves_chinese_upload_names() {
+        assert_eq!(
+            normalize_upload_filename("解析测试文档.pdf"),
+            "解析测试文档.pdf"
+        );
+    }
+
+    #[test]
     fn uniquifies_duplicate_stems() {
         let mut uploads = vec![
             StoredUpload {
