@@ -15,8 +15,9 @@ use pdfium_render::prelude::*;
 use tokio::{fs, sync::Semaphore};
 
 use crate::{
-    domain::models::{ContentBlock, ParseTask, ParsedDocument, StoredUpload},
+    domain::models::{ContentBlock, DocumentKind, ParseTask, ParsedDocument, StoredUpload},
     error::{ApiError, ApiResult},
+    io::document_writer::DocumentOutputWriter,
 };
 
 use super::client::{
@@ -116,7 +117,7 @@ impl VlmDocumentParser {
             scheduler,
             processing_window_size,
             vlm_max_concurrency,
-            vlm_max_concurrency.min(8).max(1),
+            vlm_max_concurrency.clamp(1, 8),
             image_preprocess_threads,
         )
     }
@@ -179,7 +180,8 @@ impl VlmDocumentParser {
             let document = self.parse_upload(task, &upload).await?;
             let parse_upload_ms = upload_started_at.elapsed().as_millis();
             let write_started_at = Instant::now();
-            self.write_document(&task.output_dir, &document).await?;
+            DocumentOutputWriter::write_document(&task.output_dir, &document, DocumentKind::Pdf)
+                .await?;
             tracing::debug!(
                 task_id = %task.task_id,
                 file_name = %document.file_name,
@@ -765,51 +767,6 @@ impl VlmDocumentParser {
         let path = image_dir.join(format!("page_{page_index}_block_{block_index}.png"));
         fs::write(&path, image_png).await?;
         Ok(path)
-    }
-
-    async fn write_document(&self, output_dir: &Path, document: &ParsedDocument) -> ApiResult<()> {
-        let started_at = Instant::now();
-        let parse_dir = output_dir.join(&document.file_name).join("vlm");
-        let images_dir = parse_dir.join("images");
-        fs::create_dir_all(&images_dir).await?;
-        fs::write(
-            parse_dir.join(format!("{}.md", document.file_name)),
-            &document.markdown,
-        )
-        .await?;
-        fs::write(
-            parse_dir.join(format!("{}_middle.json", document.file_name)),
-            serde_json::to_vec_pretty(&document.middle_json)?,
-        )
-        .await?;
-        fs::write(
-            parse_dir.join(format!("{}_model.json", document.file_name)),
-            serde_json::to_vec_pretty(&document.model_output)?,
-        )
-        .await?;
-        fs::write(
-            parse_dir.join(format!("{}_content_list.json", document.file_name)),
-            serde_json::to_vec_pretty(&document.content_list)?,
-        )
-        .await?;
-        fs::write(
-            parse_dir.join(format!("{}_content_list_v2.json", document.file_name)),
-            serde_json::to_vec_pretty(&document.content_list_v2)?,
-        )
-        .await?;
-
-        for image_file in &document.image_files {
-            if let Some(name) = image_file.file_name() {
-                fs::copy(image_file, images_dir.join(name)).await?;
-            }
-        }
-        tracing::debug!(
-            file_name = %document.file_name,
-            image_count = document.image_files.len(),
-            elapsed_ms = started_at.elapsed().as_millis(),
-            "document files written"
-        );
-        Ok(())
     }
 
     async fn load_image_pages(&self, upload: &StoredUpload) -> ApiResult<Vec<RenderedPage>> {

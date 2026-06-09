@@ -3,6 +3,8 @@ mod domain;
 mod error;
 mod io;
 mod memory;
+mod office;
+mod parser;
 mod server;
 mod vlm;
 

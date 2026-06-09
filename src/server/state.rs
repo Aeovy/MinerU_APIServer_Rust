@@ -6,6 +6,8 @@ use crate::{
     config::{CliArgs, ServiceConfig},
     domain::tasks::TaskManager,
     error::{ApiError, ApiResult},
+    office::OfficeDocumentParser,
+    parser::DocumentParserRouter,
     vlm::{client::VlmHttpClient, parser::VlmDocumentParser, scheduler::VlmRequestScheduler},
 };
 
@@ -17,7 +19,7 @@ pub struct AppState {
 pub struct AppStateInner {
     pub config: ServiceConfig,
     pub task_manager: Arc<TaskManager>,
-    pub parser: Arc<VlmDocumentParser>,
+    pub parser: Arc<DocumentParserRouter>,
     pub vlm_scheduler: Arc<VlmRequestScheduler>,
     pub admission_semaphore: Arc<Semaphore>,
     pub request_semaphore: Arc<Semaphore>,
@@ -40,7 +42,7 @@ impl AppState {
             config.vlm_max_concurrency,
             config.vlm_queue_capacity,
         );
-        let parser = Arc::new(VlmDocumentParser::with_scheduler(
+        let vlm_parser = Arc::new(VlmDocumentParser::with_scheduler(
             client,
             vlm_scheduler.clone(),
             config.processing_window_size,
@@ -48,6 +50,10 @@ impl AppState {
             config.max_vlm_requests_per_task,
             config.image_preprocess_threads,
         )?);
+        let parser = Arc::new(DocumentParserRouter::new(
+            vlm_parser,
+            Arc::new(OfficeDocumentParser::new()),
+        ));
         let admission_semaphore = Arc::new(Semaphore::new(config.max_in_flight_tasks));
         let request_semaphore = Arc::new(Semaphore::new(config.max_concurrent_requests));
         let state = Self {
@@ -72,7 +78,7 @@ impl AppState {
         self.inner.task_manager.clone()
     }
 
-    pub fn parser(&self) -> Arc<VlmDocumentParser> {
+    pub fn parser(&self) -> Arc<DocumentParserRouter> {
         self.inner.parser.clone()
     }
 

@@ -114,6 +114,41 @@ pub struct StoredUpload {
     pub suffix: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentKind {
+    Pdf,
+    Image,
+    Office,
+}
+
+impl DocumentKind {
+    pub fn from_suffix(suffix: &str) -> Option<Self> {
+        match suffix {
+            "pdf" => Some(Self::Pdf),
+            "png" | "jpeg" | "jp2" | "webp" | "gif" | "bmp" | "jpg" | "tiff" => Some(Self::Image),
+            "docx" | "pptx" | "xlsx" => Some(Self::Office),
+            _ => None,
+        }
+    }
+
+    pub fn output_subdir(self) -> &'static str {
+        match self {
+            Self::Pdf | Self::Image => "vlm",
+            Self::Office => "office",
+        }
+    }
+
+    pub fn is_vlm(self) -> bool {
+        matches!(self, Self::Pdf | Self::Image)
+    }
+}
+
+impl StoredUpload {
+    pub fn document_kind(&self) -> Option<DocumentKind> {
+        DocumentKind::from_suffix(&self.suffix)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum TaskStatus {
@@ -270,4 +305,30 @@ pub struct ParsedDocument {
     pub content_list: Value,
     pub content_list_v2: Value,
     pub image_files: Vec<PathBuf>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DocumentKind;
+
+    #[test]
+    fn maps_supported_document_kinds() {
+        assert_eq!(DocumentKind::from_suffix("pdf"), Some(DocumentKind::Pdf));
+        assert_eq!(DocumentKind::from_suffix("png"), Some(DocumentKind::Image));
+        assert_eq!(
+            DocumentKind::from_suffix("docx"),
+            Some(DocumentKind::Office)
+        );
+        assert_eq!(
+            DocumentKind::from_suffix("pptx"),
+            Some(DocumentKind::Office)
+        );
+        assert_eq!(
+            DocumentKind::from_suffix("xlsx"),
+            Some(DocumentKind::Office)
+        );
+        assert_eq!(DocumentKind::from_suffix("doc"), None);
+        assert_eq!(DocumentKind::from_suffix("ppt"), None);
+        assert_eq!(DocumentKind::from_suffix("xls"), None);
+    }
 }
