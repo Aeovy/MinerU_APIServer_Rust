@@ -5,7 +5,7 @@ use crate::{
     error::{ApiError, ApiResult},
     office::{
         markdown::to_parsed_document,
-        model::{OfficeBlock, OfficeDocument, OfficeImage, OfficePage},
+        model::{OfficeBlock, OfficeDiscardedBlock, OfficeDocument, OfficeImage, OfficePage},
         package::{local_name, OoxmlPackage},
         rels::{read_relationships, relationship_target_part},
         writer_adapter::OfficeMediaWriter,
@@ -38,6 +38,8 @@ pub async fn parse_docx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
     reader.config_mut().trim_text(false);
     let mut blocks = Vec::new();
     let mut images = Vec::new();
+    let mut discarded_blocks = Vec::new();
+    let mut warnings = Vec::new();
     let mut paragraph = ParagraphState::default();
     let mut table = TableState::default();
     let mut in_paragraph = false;
@@ -80,7 +82,9 @@ pub async fn parse_docx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
                 }
                 b"tr" if in_table => table.start_row(),
                 b"tc" if in_table => table.start_cell(),
-                b"t" => text_capture = TextCapture::text(),
+                b"t" if text_capture.kind != TextCaptureKind::Equation => {
+                    text_capture = TextCapture::text()
+                }
                 b"tab" if in_paragraph => {
                     paragraph.push_text("\t", &run_style, hyperlink_stack.last())
                 }
@@ -89,23 +93,19 @@ pub async fn parse_docx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
                 }
                 b"oMath" => text_capture = TextCapture::equation(),
                 b"blip" | b"imagedata" => {
-                    if let Some(image) =
-                        extract_docx_image(&package, &media_writer, &event, &reader).await?
-                    {
-                        let relative_path = image.file_name.clone();
-                        images.push(image);
-                        if in_table {
-                            table.push_cell_text(&format!(r#"<img src="{relative_path}" />"#));
-                        } else if in_paragraph {
-                            if !paragraph.flush_as_block(&mut blocks) {
-                                paragraph.clear();
-                            }
-                            blocks.push(OfficeBlock::Image {
-                                path: relative_path,
-                                alt: "image".to_string(),
-                            });
-                        }
-                    }
+                    let mut image_context = DocxImageContext {
+                        images: &mut images,
+                        blocks: &mut blocks,
+                        table: &mut table,
+                        paragraph: &mut paragraph,
+                        discarded_blocks: &mut discarded_blocks,
+                        warnings: &mut warnings,
+                    };
+                    image_context.handle(
+                        extract_docx_image(&package, &media_writer, &event, &reader).await?,
+                        in_table,
+                        in_paragraph,
+                    );
                 }
                 _ => {}
             },
@@ -132,20 +132,19 @@ pub async fn parse_docx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
                     paragraph.push_text("\n", &run_style, hyperlink_stack.last())
                 }
                 b"blip" | b"imagedata" => {
-                    if let Some(image) =
-                        extract_docx_image(&package, &media_writer, &event, &reader).await?
-                    {
-                        let relative_path = image.file_name.clone();
-                        images.push(image);
-                        if in_table {
-                            table.push_cell_text(&format!(r#"<img src="{relative_path}" />"#));
-                        } else {
-                            blocks.push(OfficeBlock::Image {
-                                path: relative_path,
-                                alt: "image".to_string(),
-                            });
-                        }
-                    }
+                    let mut image_context = DocxImageContext {
+                        images: &mut images,
+                        blocks: &mut blocks,
+                        table: &mut table,
+                        paragraph: &mut paragraph,
+                        discarded_blocks: &mut discarded_blocks,
+                        warnings: &mut warnings,
+                    };
+                    image_context.handle(
+                        extract_docx_image(&package, &media_writer, &event, &reader).await?,
+                        in_table,
+                        in_paragraph,
+                    );
                 }
                 _ => {}
             },
@@ -175,7 +174,9 @@ pub async fn parse_docx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
                 }
             }
             Ok(Event::End(event)) => match local_name(event.name().as_ref()) {
-                b"t" => text_capture = TextCapture::none(),
+                b"t" if text_capture.kind != TextCaptureKind::Equation => {
+                    text_capture = TextCapture::none()
+                }
                 b"oMath" => text_capture = TextCapture::none(),
                 b"hyperlink" => {
                     hyperlink_stack.pop();
@@ -211,11 +212,13 @@ pub async fn parse_docx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
         pages: vec![OfficePage {
             page_idx: 0,
             blocks: merge_adjacent_list_blocks(blocks),
+            discarded_blocks,
         }],
         images,
         model_output: json!({
             "type": "docx",
-            "source": upload.stem
+            "source": upload.stem,
+            "warnings": warnings
         }),
     };
     Ok(to_parsed_document(upload.stem.clone(), office_document))
@@ -254,15 +257,15 @@ impl ParagraphState {
         if value.is_empty() {
             return;
         }
-        let mut rendered = html_escape(value);
-        rendered = style.wrap(rendered);
         if let Some(Some(url)) = hyperlink {
-            rendered = format!(
-                r#"<hyperlink><text>{}</text><url>{}</url></hyperlink>"#,
-                rendered,
+            self.parts.push(format!(
+                r#"<hyperlink>{}<url>{}</url></hyperlink>"#,
+                style.wrap_text_tag(html_escape(value)),
                 html_escape(url)
-            );
+            ));
+            return;
         }
+        let rendered = style.wrap(html_escape(value));
         self.parts.push(rendered);
     }
 
@@ -318,9 +321,22 @@ struct RunStyle {
 
 impl RunStyle {
     fn wrap(&self, content: String) -> String {
-        if !self.bold && !self.italic && !self.underline && !self.strikethrough {
+        let styles = self.styles();
+        if styles.is_empty() {
             return content;
         }
+        format!(r#"<text style="{}">{}</text>"#, styles.join(","), content)
+    }
+
+    fn wrap_text_tag(&self, content: String) -> String {
+        let styles = self.styles();
+        if styles.is_empty() {
+            return format!("<text>{content}</text>");
+        }
+        format!(r#"<text style="{}">{}</text>"#, styles.join(","), content)
+    }
+
+    fn styles(&self) -> Vec<&'static str> {
         let mut styles = Vec::new();
         if self.bold {
             styles.push("bold");
@@ -334,7 +350,7 @@ impl RunStyle {
         if self.strikethrough {
             styles.push("strikethrough");
         }
-        format!(r#"<text style="{}">{}</text>"#, styles.join(","), content)
+        styles
     }
 }
 
@@ -444,29 +460,91 @@ async fn extract_docx_image(
     media_writer: &OfficeMediaWriter,
     event: &BytesStart<'_>,
     reader: &quick_xml::Reader<&[u8]>,
-) -> ApiResult<Option<OfficeImage>> {
+) -> ApiResult<DocxImageExtraction> {
     let rel_id = attr_value(event, reader, b"embed")?
         .or_else(|| attr_value(event, reader, b"id").ok().flatten());
     let Some(rel_id) = rel_id else {
-        return Ok(None);
+        return Ok(DocxImageExtraction::None);
     };
     let Some(part) = relationship_target_part(package, WORD_DOCUMENT_PART, &rel_id)? else {
         tracing::warn!(rel_id, "DOCX image relationship target missing");
-        return Ok(None);
+        return Ok(DocxImageExtraction::Skipped {
+            reason: "missing_relationship_target".to_string(),
+            detail: format!("DOCX image relationship target missing for {rel_id}"),
+        });
     };
     let Some(bytes) = package.read(&part) else {
         tracing::warn!(part, "DOCX image part missing");
-        return Ok(None);
+        return Ok(DocxImageExtraction::Skipped {
+            reason: "missing_image_part".to_string(),
+            detail: format!("DOCX image part missing: {part}"),
+        });
     };
     let suggested_name = Path::new(&part)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("image");
     match media_writer.write_image(suggested_name, bytes).await {
-        Ok(image) => Ok(Some(image)),
+        Ok(image) => Ok(DocxImageExtraction::Image(image)),
         Err(error) => {
             tracing::warn!(error = %error.detail(), "failed to write DOCX image");
-            Ok(None)
+            Ok(DocxImageExtraction::Skipped {
+                reason: "image_write_failed".to_string(),
+                detail: error.detail(),
+            })
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DocxImageExtraction {
+    Image(OfficeImage),
+    Skipped { reason: String, detail: String },
+    None,
+}
+
+struct DocxImageContext<'a> {
+    images: &'a mut Vec<OfficeImage>,
+    blocks: &'a mut Vec<OfficeBlock>,
+    table: &'a mut TableState,
+    paragraph: &'a mut ParagraphState,
+    discarded_blocks: &'a mut Vec<OfficeDiscardedBlock>,
+    warnings: &'a mut Vec<String>,
+}
+
+impl DocxImageContext<'_> {
+    fn handle(&mut self, result: DocxImageExtraction, in_table: bool, in_paragraph: bool) {
+        match result {
+            DocxImageExtraction::Image(image) => {
+                let relative_path = image.file_name.clone();
+                self.images.push(image);
+                if in_table {
+                    self.table
+                        .push_cell_text(&format!(r#"<img src="{relative_path}" />"#));
+                } else if in_paragraph {
+                    if !self.paragraph.flush_as_block(self.blocks) {
+                        self.paragraph.clear();
+                    }
+                    self.blocks.push(OfficeBlock::Image {
+                        path: relative_path,
+                        alt: "image".to_string(),
+                    });
+                } else {
+                    self.blocks.push(OfficeBlock::Image {
+                        path: relative_path,
+                        alt: "image".to_string(),
+                    });
+                }
+            }
+            DocxImageExtraction::Skipped { reason, detail } => {
+                self.warnings.push(format!("{reason}: {detail}"));
+                self.discarded_blocks.push(OfficeDiscardedBlock {
+                    index: self.discarded_blocks.len(),
+                    reason,
+                    detail,
+                });
+            }
+            DocxImageExtraction::None => {}
         }
     }
 }

@@ -3,7 +3,10 @@ use serde_json::{json, Value};
 use crate::{
     config::MINERU_VERSION,
     domain::models::ParsedDocument,
-    office::model::{OfficeBlock, OfficeDocument},
+    office::{
+        inline::{parse_inline_spans, InlineSpan},
+        model::{OfficeBlock, OfficeDocument},
+    },
 };
 
 pub fn to_parsed_document(file_name: String, office_document: OfficeDocument) -> ParsedDocument {
@@ -41,7 +44,11 @@ fn make_middle_json(document: &OfficeDocument) -> Value {
                     .enumerate()
                     .map(|(index, block)| block.to_middle_json(index))
                     .collect::<Vec<Value>>(),
-                "discarded_blocks": []
+                "discarded_blocks": page
+                    .discarded_blocks
+                    .iter()
+                    .map(|block| block.to_middle_json())
+                    .collect::<Vec<Value>>()
             }))
             .collect::<Vec<Value>>(),
         "_backend": "office",
@@ -106,13 +113,13 @@ fn make_markdown(document: &OfficeDocument) -> String {
     for page in &document.pages {
         for block in &page.blocks {
             match block {
-                OfficeBlock::Text { content } => parts.push(escape_markdown_text(content)),
+                OfficeBlock::Text { content } => parts.push(render_inline_markdown(content)),
                 OfficeBlock::Title { content, level } => {
                     let depth = (*level).clamp(1, 6);
                     parts.push(format!(
                         "{} {}",
                         "#".repeat(depth),
-                        escape_markdown_text(content)
+                        render_inline_markdown(content)
                     ));
                 }
                 OfficeBlock::Table { html } | OfficeBlock::Chart { html } => {
@@ -128,7 +135,7 @@ fn make_markdown(document: &OfficeDocument) -> String {
                     parts.push(
                         items
                             .iter()
-                            .map(|item| format!("- {}", escape_markdown_text(item)))
+                            .map(|item| format!("- {}", render_inline_markdown(item)))
                             .collect::<Vec<String>>()
                             .join("\n"),
                     );
@@ -147,6 +154,46 @@ fn replace_equation_tags(html: &str) -> String {
     html.replace("<eq>", " $").replace("</eq>", "$ ")
 }
 
+fn render_inline_markdown(content: &str) -> String {
+    parse_inline_spans(content)
+        .iter()
+        .map(render_inline_span)
+        .collect::<String>()
+}
+
+fn render_inline_span(span: &InlineSpan) -> String {
+    match span {
+        InlineSpan::Text { content, styles } => apply_markdown_styles(content, styles),
+        InlineSpan::InlineEquation { content } => format!("${}$", content.trim()),
+        InlineSpan::Hyperlink {
+            content,
+            url,
+            styles,
+        } => format!(
+            "[{}]({})",
+            apply_markdown_styles(content, styles),
+            escape_link_destination(url)
+        ),
+    }
+}
+
+fn apply_markdown_styles(content: &str, styles: &[String]) -> String {
+    let mut rendered = escape_markdown_text(content);
+    if styles.iter().any(|style| style == "bold") {
+        rendered = format!("**{rendered}**");
+    }
+    if styles.iter().any(|style| style == "italic") {
+        rendered = format!("*{rendered}*");
+    }
+    if styles.iter().any(|style| style == "underline") {
+        rendered = format!("<u>{rendered}</u>");
+    }
+    if styles.iter().any(|style| style == "strikethrough") {
+        rendered = format!("~~{rendered}~~");
+    }
+    rendered
+}
+
 fn escape_markdown_text(text: &str) -> String {
     text.replace('\\', "\\\\")
         .replace('[', "\\[")
@@ -156,4 +203,8 @@ fn escape_markdown_text(text: &str) -> String {
 
 fn escape_link_text(text: &str) -> String {
     text.replace('[', "\\[").replace(']', "\\]")
+}
+
+fn escape_link_destination(text: &str) -> String {
+    text.replace(')', "%29").replace(' ', "%20")
 }
