@@ -1,4 +1,5 @@
 pub mod docx;
+pub mod inline;
 pub mod markdown;
 pub mod model;
 pub mod package;
@@ -101,6 +102,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parses_docx_inline_spans_and_records_skipped_images() {
+        let temp = tempdir().expect("tempdir");
+        let upload_path = temp.path().join("inline.docx");
+        write_zip(
+            &upload_path,
+            &[
+                (
+                    "[Content_Types].xml",
+                    br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>"#.as_slice(),
+                ),
+                (
+                    "word/document.xml",
+                    br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body><w:p><w:r><w:b/><w:t>Bold</w:t></w:r><w:r><w:t> and </w:t></w:r><w:hyperlink r:id="rLink"><w:r><w:u/><w:t>Link</w:t></w:r></w:hyperlink><m:oMath xmlns:m="http://schemas.openxmlformats.org/officeDocument/2006/math"><m:r><m:t>x+1</m:t></m:r></m:oMath></w:p><w:p><w:r><w:drawing><a:blip r:embed="rMissing"/></w:drawing></w:r></w:p></w:body></w:document>"#.as_slice(),
+                ),
+                (
+                    "word/_rels/document.xml.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rLink" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" Target="https://example.com" TargetMode="External"/><Relationship Id="rMissing" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/missing.png"/></Relationships>"#.as_slice(),
+                ),
+            ],
+        );
+        let task = task_for_upload(temp.path().to_path_buf(), &upload_path, "docx");
+        let parser = OfficeDocumentParser::new();
+        let document = parser
+            .parse_upload(
+                &task,
+                &StoredUpload {
+                    stem: "inline".to_string(),
+                    path: upload_path,
+                    suffix: "docx".to_string(),
+                },
+            )
+            .await
+            .expect("docx should parse");
+
+        let spans = &document.middle_json["pdf_info"][0]["para_blocks"][0]["lines"][0]["spans"];
+        assert!(spans
+            .as_array()
+            .expect("spans should be an array")
+            .iter()
+            .any(|span| span["type"] == "hyperlink" && span["url"] == "https://example.com"));
+        assert!(spans
+            .as_array()
+            .expect("spans should be an array")
+            .iter()
+            .any(|span| span["type"] == "inline_equation" && span["content"] == "x+1"));
+        assert!(document.markdown.contains("**Bold**"));
+        assert!(document
+            .markdown
+            .contains("[<u>Link</u>](https://example.com)"));
+        assert!(document.markdown.contains("$x+1$"));
+        assert_eq!(
+            document.middle_json["pdf_info"][0]["discarded_blocks"][0]["reason"],
+            "missing_image_part"
+        );
+        assert!(document.model_output["warnings"][0]
+            .as_str()
+            .expect("warning should be string")
+            .contains("missing_image_part"));
+    }
+
+    #[tokio::test]
     async fn parses_pptx_slide_order_and_notes() {
         let temp = tempdir().expect("tempdir");
         let upload_path = temp.path().join("slides.pptx");
@@ -160,6 +222,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parses_pptx_xy_order_and_filters_decorative_images() {
+        let temp = tempdir().expect("tempdir");
+        let upload_path = temp.path().join("layout.pptx");
+        write_zip(
+            &upload_path,
+            &[
+                (
+                    "[Content_Types].xml",
+                    br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/></Types>"#.as_slice(),
+                ),
+                (
+                    "ppt/presentation.xml",
+                    br#"<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:sldSz cx="9144000" cy="5143500"/><p:sldIdLst><p:sldId id="1" r:id="rId1"/></p:sldIdLst></p:presentation>"#.as_slice(),
+                ),
+                (
+                    "ppt/_rels/presentation.xml.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide1.xml"/></Relationships>"#.as_slice(),
+                ),
+                (
+                    "ppt/slides/slide1.xml",
+                    br#"<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><p:cSld><p:spTree><p:sp><p:spPr><a:xfrm><a:off x="100000" y="2000000"/><a:ext cx="2000000" cy="500000"/></a:xfrm></p:spPr><p:txBody><a:p><a:r><a:t>Lower text</a:t></a:r></a:p></p:txBody></p:sp><p:sp><p:spPr><a:xfrm><a:off x="100000" y="100000"/><a:ext cx="2000000" cy="500000"/></a:xfrm></p:spPr><p:txBody><a:p><a:r><a:t>Upper text</a:t></a:r></a:p></p:txBody></p:sp><p:pic><p:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="9144000" cy="5143500"/></a:xfrm></p:spPr><p:blipFill><a:blip r:embed="rBg"/></p:blipFill></p:pic><p:pic><p:spPr><a:xfrm><a:off x="500000" y="500000"/><a:ext cx="50000" cy="50000"/></a:xfrm></p:spPr><p:blipFill><a:blip r:embed="rTiny"/></p:blipFill></p:pic></p:spTree></p:cSld></p:sld>"#.as_slice(),
+                ),
+                (
+                    "ppt/slides/_rels/slide1.xml.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rBg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/background.png"/><Relationship Id="rTiny" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/tiny.png"/></Relationships>"#.as_slice(),
+                ),
+                ("ppt/media/background.png", b"background-bytes".as_slice()),
+                ("ppt/media/tiny.png", b"tiny-bytes".as_slice()),
+            ],
+        );
+        let task = task_for_upload(temp.path().to_path_buf(), &upload_path, "pptx");
+        let parser = OfficeDocumentParser::new();
+        let document = parser
+            .parse_upload(
+                &task,
+                &StoredUpload {
+                    stem: "layout".to_string(),
+                    path: upload_path,
+                    suffix: "pptx".to_string(),
+                },
+            )
+            .await
+            .expect("pptx should parse");
+
+        let upper_position = document
+            .markdown
+            .find("Upper text")
+            .expect("upper text should be emitted");
+        let lower_position = document
+            .markdown
+            .find("Lower text")
+            .expect("lower text should be emitted");
+        assert!(upper_position < lower_position);
+        assert!(document.image_files.is_empty());
+    }
+
+    #[tokio::test]
     async fn parses_xlsx_visible_sheets_and_skips_hidden() {
         let temp = tempdir().expect("tempdir");
         let upload_path = temp.path().join("book.xlsx");
@@ -184,7 +303,7 @@ mod tests {
                 ),
                 (
                     "xl/worksheets/sheet1.xml",
-                    br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Name</t></is></c><c r="B1" t="inlineStr"><is><t>Value</t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>alpha</t></is></c><c r="B2"><v>42</v></c></row></sheetData></worksheet>"#.as_slice(),
+                    br#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>Merged Header</t></is></c><c r="B1" t="inlineStr"><is><t></t></is></c></row><row r="2"><c r="A2" t="inlineStr"><is><t>alpha</t></is></c><c r="B2"><v>42</v></c></row></sheetData><mergeCells count="1"><mergeCell ref="A1:B1"/></mergeCells></worksheet>"#.as_slice(),
                 ),
                 (
                     "xl/worksheets/sheet2.xml",
@@ -208,6 +327,7 @@ mod tests {
 
         assert!(document.markdown.contains("alpha"));
         assert!(document.markdown.contains("<table>"));
+        assert!(document.markdown.contains(r#"colspan="2""#));
         assert!(!document.markdown.contains("hidden text"));
     }
 

@@ -1,6 +1,6 @@
 use std::{fs::File, io::BufReader};
 
-use calamine::{open_workbook, Data, Reader, SheetVisible, Xlsx};
+use calamine::{open_workbook, Data, Dimensions, Reader, SheetVisible, Xlsx};
 use serde_json::json;
 
 use crate::{
@@ -47,7 +47,12 @@ pub async fn parse_xlsx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
         let range = workbook
             .worksheet_range(&sheet_name)
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
-        let mut blocks = blocks_from_sheet(&sheet_name, &range);
+        let merges = workbook
+            .worksheet_merge_cells(&sheet_name)
+            .transpose()
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?
+            .unwrap_or_default();
+        let mut blocks = blocks_from_sheet(&sheet_name, &range, &merges);
         if blocks.is_empty() {
             continue;
         }
@@ -66,7 +71,11 @@ pub async fn parse_xlsx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
                 },
             );
         }
-        pages.push(OfficePage { page_idx, blocks });
+        pages.push(OfficePage {
+            page_idx,
+            blocks,
+            discarded_blocks: Vec::new(),
+        });
     }
     if pages.is_empty() && !images.is_empty() {
         pages.push(OfficePage {
@@ -78,6 +87,7 @@ pub async fn parse_xlsx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
                     alt: "image".to_string(),
                 })
                 .collect(),
+            discarded_blocks: Vec::new(),
         });
     } else if !images.is_empty() {
         for image in &images {
@@ -101,7 +111,11 @@ pub async fn parse_xlsx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
     Ok(to_parsed_document(upload.stem.clone(), office_document))
 }
 
-fn blocks_from_sheet(sheet_name: &str, range: &calamine::Range<Data>) -> Vec<OfficeBlock> {
+fn blocks_from_sheet(
+    sheet_name: &str,
+    range: &calamine::Range<Data>,
+    merges: &[Dimensions],
+) -> Vec<OfficeBlock> {
     let used_rows = range
         .rows()
         .map(|row| row.iter().map(data_to_text).collect::<Vec<String>>())
@@ -111,12 +125,14 @@ fn blocks_from_sheet(sheet_name: &str, range: &calamine::Range<Data>) -> Vec<Off
         return Vec::new();
     }
     let non_empty_cells = trimmed
+        .rows
         .iter()
         .flat_map(|row| row.iter())
         .filter(|cell| !cell.trim().is_empty())
         .count();
     if non_empty_cells == 1 {
         let text = trimmed
+            .rows
             .iter()
             .flat_map(|row| row.iter())
             .find(|cell| !cell.trim().is_empty())
@@ -125,11 +141,58 @@ fn blocks_from_sheet(sheet_name: &str, range: &calamine::Range<Data>) -> Vec<Off
         return vec![OfficeBlock::Text { content: text }];
     }
     vec![OfficeBlock::Table {
-        html: rows_to_html_table(sheet_name, &trimmed),
+        html: rows_to_html_table(sheet_name, &trimmed.rows, &trimmed.merges_from(merges)),
     }]
 }
 
-fn trim_empty_edges(rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
+#[derive(Debug, Clone)]
+struct TrimmedSheet {
+    rows: Vec<Vec<String>>,
+    row_offset: usize,
+    col_offset: usize,
+}
+
+impl TrimmedSheet {
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Convert absolute workbook merge dimensions to table-relative dimensions.
+    ///
+    /// Inputs:
+    /// - `merges`: merge dimensions reported by calamine in zero-based sheet coordinates.
+    fn merges_from(&self, merges: &[Dimensions]) -> Vec<Dimensions> {
+        let row_offset = self.row_offset as u32;
+        let col_offset = self.col_offset as u32;
+        let row_count = self.rows.len() as u32;
+        let col_count = self.rows.first().map(Vec::len).unwrap_or_default() as u32;
+        merges
+            .iter()
+            .filter_map(|merge| {
+                if merge.start.0 < row_offset || merge.start.1 < col_offset {
+                    return None;
+                }
+                let start_row = merge.start.0 - row_offset;
+                let start_col = merge.start.1 - col_offset;
+                let end_row = merge.end.0.saturating_sub(row_offset);
+                let end_col = merge.end.1.saturating_sub(col_offset);
+                if start_row >= row_count || start_col >= col_count {
+                    return None;
+                }
+                Some(Dimensions {
+                    start: (start_row, start_col),
+                    end: (
+                        end_row.min(row_count.saturating_sub(1)),
+                        end_col.min(col_count.saturating_sub(1)),
+                    ),
+                })
+            })
+            .filter(|merge| merge.end.0 > merge.start.0 || merge.end.1 > merge.start.1)
+            .collect()
+    }
+}
+
+fn trim_empty_edges(rows: Vec<Vec<String>>) -> TrimmedSheet {
     let mut min_row = usize::MAX;
     let mut max_row = 0_usize;
     let mut min_col = usize::MAX;
@@ -146,31 +209,65 @@ fn trim_empty_edges(rows: Vec<Vec<String>>) -> Vec<Vec<String>> {
         }
     }
     if min_row == usize::MAX {
-        return Vec::new();
+        return TrimmedSheet {
+            rows: Vec::new(),
+            row_offset: 0,
+            col_offset: 0,
+        };
     }
-    rows[min_row..=max_row]
+    let rows = rows[min_row..=max_row]
         .iter()
         .map(|row| {
             (min_col..=max_col)
                 .map(|index| row.get(index).cloned().unwrap_or_default())
                 .collect::<Vec<String>>()
         })
-        .collect()
+        .collect();
+    TrimmedSheet {
+        rows,
+        row_offset: min_row,
+        col_offset: min_col,
+    }
 }
 
-fn rows_to_html_table(sheet_name: &str, rows: &[Vec<String>]) -> String {
+fn rows_to_html_table(sheet_name: &str, rows: &[Vec<String>], merges: &[Dimensions]) -> String {
     let caption = format!("<caption>{}</caption>", html_escape(sheet_name));
     let body = rows
         .iter()
-        .map(|row| {
+        .enumerate()
+        .map(|(row_index, row)| {
             let cells = row
                 .iter()
-                .map(|cell| format!("<td>{}</td>", html_escape(cell)))
+                .enumerate()
+                .filter_map(|(col_index, cell)| {
+                    cell_to_html(row_index as u32, col_index as u32, cell, merges)
+                })
                 .collect::<String>();
             format!("<tr>{cells}</tr>")
         })
         .collect::<String>();
     format!("<table>{caption}{body}</table>")
+}
+
+fn cell_to_html(row: u32, col: u32, cell: &str, merges: &[Dimensions]) -> Option<String> {
+    if merges
+        .iter()
+        .any(|merge| merge.contains(row, col) && merge.start != (row, col))
+    {
+        return None;
+    }
+    let mut attrs = String::new();
+    if let Some(merge) = merges.iter().find(|merge| merge.start == (row, col)) {
+        let rowspan = merge.end.0 - merge.start.0 + 1;
+        let colspan = merge.end.1 - merge.start.1 + 1;
+        if rowspan > 1 {
+            attrs.push_str(&format!(r#" rowspan="{rowspan}""#));
+        }
+        if colspan > 1 {
+            attrs.push_str(&format!(r#" colspan="{colspan}""#));
+        }
+    }
+    Some(format!("<td{attrs}>{}</td>", html_escape(cell)))
 }
 
 fn data_to_text(cell: &Data) -> String {
