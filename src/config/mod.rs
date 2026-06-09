@@ -91,9 +91,7 @@ impl ServiceConfig {
         );
         let max_vlm_requests_per_task = read_usize_env(
             "MINERU_VLM_MAX_REQUESTS_PER_TASK",
-            vlm_max_concurrency
-                .min(DEFAULT_VLM_MAX_REQUESTS_PER_TASK_CEILING)
-                .max(1),
+            vlm_max_concurrency.clamp(1, DEFAULT_VLM_MAX_REQUESTS_PER_TASK_CEILING),
             1,
         )
         .min(vlm_max_concurrency)
