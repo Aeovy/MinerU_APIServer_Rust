@@ -1,7 +1,9 @@
 # MinerU Rust API Server
 ## 项目简介
 
-这是官方 Python 包 `mineru-api` 的 Rust 版本实现，提供兼容的 API 接口和相近的解析 Pipeline，用于通过 OpenAI-compatible VLM 服务解析 PDF 和图片文件。注意，只支持**vlm-http-client**!
+这是官方 Python 包 `mineru-api` 的 Rust 版本实现，提供兼容的 API 接口和相近的解析 Pipeline，用于通过 OpenAI-compatible VLM 服务解析 PDF 和图片文件，并用纯 Rust OOXML 解析器支持 `docx`、`pptx`、`xlsx` Office 文件。注意，PDF/图片解析只支持**vlm-http-client**!
+
+Office 支持范围限定为 OOXML 格式：`docx`、`pptx`、`xlsx`。旧二进制 Office 格式 `doc`、`ppt`、`xls` 不支持；如需解析旧格式，请先在外部转换为 OOXML。
 
 官方 Python 包至3.1.7版本，仍然存在解析数十个文档后，内存占用持续增长且不会回落的问题，同时仍存在2.X.X版本可能的内存泄漏问题。
 
@@ -13,6 +15,7 @@ Rust 版本重点优化长时间运行的稳定性、内存占用和部署体验
 - Docker 镜像部署
 - 更丰富的并发和资源配置项
 - `/health/ui` 可视化监控界面
+- Office OOXML 文本、标题、表格、图片、基础公式/超链接解析输出
 
 **Python 版本内存占用**
 

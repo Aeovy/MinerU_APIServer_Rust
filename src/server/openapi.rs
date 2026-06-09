@@ -89,7 +89,9 @@ fn multipart_form_schema() -> ObjectBuilder {
                         .schema_type(Type::String)
                         .format(Some(SchemaFormat::KnownFormat(KnownFormat::Binary))),
                 )
-                .description(Some("Upload PDF or image files for parsing")),
+                .description(Some(
+                    "Upload PDF, image, or Office OOXML files (docx, pptx, xlsx) for parsing",
+                )),
         )
         .property(
             "lang_list",
@@ -150,4 +152,23 @@ fn page_id_schema(default: i32) -> ObjectBuilder {
         .schema_type(Type::Integer)
         .default(Some(json!(default)))
         .minimum(Some(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use utoipa::OpenApi;
+
+    use super::ApiDoc;
+
+    #[test]
+    fn multipart_schema_documents_office_ooxml_uploads() {
+        let value = serde_json::to_value(ApiDoc::openapi()).expect("openapi serializes");
+        let description = value["paths"]["/file_parse"]["post"]["requestBody"]["content"]
+            ["multipart/form-data"]["schema"]["properties"]["files"]["description"]
+            .as_str()
+            .expect("files description should exist");
+        assert!(description.contains("docx"));
+        assert!(description.contains("pptx"));
+        assert!(description.contains("xlsx"));
+    }
 }

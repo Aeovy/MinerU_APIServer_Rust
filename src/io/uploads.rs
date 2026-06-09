@@ -7,13 +7,13 @@ use axum::extract::multipart::Field;
 use tokio::{fs, io::AsyncWriteExt};
 
 use crate::{
-    domain::models::StoredUpload,
+    domain::models::{DocumentKind, StoredUpload},
     error::{ApiError, ApiResult},
 };
 
 const MAX_TASK_STEM_BYTES: usize = 200;
 const SUPPORTED_SUFFIXES: &[&str] = &[
-    "pdf", "png", "jpeg", "jp2", "webp", "gif", "bmp", "jpg", "tiff",
+    "pdf", "png", "jpeg", "jp2", "webp", "gif", "bmp", "jpg", "tiff", "docx", "pptx", "xlsx",
 ];
 
 pub struct UploadStore {
@@ -33,15 +33,17 @@ impl UploadStore {
         fs::create_dir_all(&self.upload_dir).await?;
         let original_name = field.file_name().map(ToOwned::to_owned).ok_or_else(|| {
             ApiError::BadRequest(
-                "Field 'files' must be uploaded as a file. Use curl syntax like -F 'files=@/path/to/document.pdf;type=application/pdf'.".to_string(),
+                "Field 'files' must be uploaded as a file. Use curl syntax like -F 'files=@/path/to/document.pdf;type=application/pdf' or upload docx/pptx/xlsx Office OOXML files.".to_string(),
             )
         })?;
         let filename = normalize_upload_filename(&original_name);
         let suffix = file_suffix(&filename)
             .ok_or_else(|| ApiError::BadRequest(format!("Unsupported file type: {filename}")))?;
-        if !SUPPORTED_SUFFIXES.contains(&suffix.as_str()) {
+        if !SUPPORTED_SUFFIXES.contains(&suffix.as_str())
+            || DocumentKind::from_suffix(&suffix).is_none()
+        {
             return Err(ApiError::BadRequest(format!(
-                "Unsupported file type: {suffix}"
+                "Unsupported file type: {suffix}. Supported types: PDF, images, and Office OOXML docx/pptx/xlsx."
             )));
         }
         let destination = self.unique_destination(&filename).await;

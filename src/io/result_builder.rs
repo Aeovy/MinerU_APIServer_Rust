@@ -20,7 +20,10 @@ use tokio::{fs, sync::mpsc};
 
 use crate::{
     config::MINERU_VERSION,
-    domain::{models::ParseTask, tasks::ResultReadLease},
+    domain::{
+        models::{DocumentKind, ParseTask},
+        tasks::ResultReadLease,
+    },
     error::{ApiError, ApiResult},
 };
 
@@ -106,9 +109,9 @@ impl ResultBuilder {
 async fn build_result_dict(task: &ParseTask) -> ApiResult<Value> {
     let started_at = Instant::now();
     let mut results = Map::new();
-    for file_name in &task.file_names {
+    for (file_index, file_name) in task.file_names.iter().enumerate() {
         let file_started_at = Instant::now();
-        let parse_dir = task.output_dir.join(file_name).join("vlm");
+        let parse_dir = parse_dir_for_task_file(task, file_index, file_name);
         let mut data = Map::new();
         let mut image_count = 0_usize;
         if task.return_md {
@@ -165,6 +168,15 @@ async fn build_result_dict(task: &ParseTask) -> ApiResult<Value> {
     Ok(Value::Object(results))
 }
 
+fn parse_dir_for_task_file(task: &ParseTask, file_index: usize, file_name: &str) -> PathBuf {
+    let kind = task
+        .upload_suffixes
+        .get(file_index)
+        .and_then(|suffix| DocumentKind::from_suffix(suffix))
+        .unwrap_or(DocumentKind::Pdf);
+    task.output_dir.join(file_name).join(kind.output_subdir())
+}
+
 fn build_zip_stream(task: &ParseTask, lease: Option<ResultReadLease>) -> Body {
     let (sender, receiver) = mpsc::channel::<Result<Bytes, io::Error>>(ZIP_STREAM_CHANNEL_CAPACITY);
     let task = task.clone();
@@ -205,7 +217,7 @@ fn build_zip_to_writer<W: Write>(task: &ParseTask, writer: W) -> ApiResult<W> {
     let mut writer = StreamingZipWriter::new(writer);
     for (file_index, file_name) in task.file_names.iter().enumerate() {
         let file_started_at = Instant::now();
-        let parse_dir = task.output_dir.join(file_name).join("vlm");
+        let parse_dir = parse_dir_for_task_file(task, file_index, file_name);
         add_if_requested(
             &mut writer,
             task.return_md,
@@ -309,7 +321,11 @@ fn add_file<W: Write>(
     if !path.exists() {
         return Ok(());
     }
-    let arcname = format!("{file_name}/vlm/{relative_path}");
+    let output_subdir = parse_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("vlm");
+    let arcname = format!("{file_name}/{output_subdir}/{relative_path}");
     add_path_as_file(writer, &path, &arcname)
 }
 
@@ -325,10 +341,15 @@ fn add_original_file<W: Write>(
     ) else {
         return Ok(());
     };
-    let arcname = format!("{file_name}/vlm/{file_name}_origin.pdf");
     if suffix == "pdf" {
+        let arcname = format!("{file_name}/vlm/{file_name}_origin.pdf");
         return add_path_as_file(writer, upload_path, &arcname);
     }
+    if DocumentKind::from_suffix(suffix) == Some(DocumentKind::Office) {
+        let arcname = format!("{file_name}/office/{file_name}_origin.{suffix}");
+        return add_path_as_file(writer, upload_path, &arcname);
+    }
+    let arcname = format!("{file_name}/vlm/{file_name}_origin.pdf");
     let source_bytes = std::fs::read(upload_path).map_err(ApiError::from)?;
     let bytes = image_to_pdf_bytes(&source_bytes)?;
     writer.add_bytes(&arcname, &bytes)
@@ -735,6 +756,92 @@ mod tests {
             .expect("markdown should read");
 
         assert_eq!(content, "# ok\n");
+    }
+
+    #[tokio::test]
+    async fn json_result_reads_office_output_dir() {
+        let temp = tempdir().expect("temp dir");
+        let parse_dir = temp.path().join("sample").join("office");
+        tokio::fs::create_dir_all(&parse_dir)
+            .await
+            .expect("office parse dir should be created");
+        tokio::fs::write(parse_dir.join("sample.md"), "# office\n")
+            .await
+            .expect("office markdown should write");
+        let mut task =
+            completed_zip_task(temp.path().to_path_buf(), temp.path().join("sample.docx"));
+        task.response_format_zip = false;
+        task.return_md = true;
+        task.return_original_file = false;
+        task.upload_suffixes = vec!["docx".to_string()];
+
+        let payload = ResultBuilder::build_json_payload(&task)
+            .await
+            .expect("json payload should build");
+        assert_eq!(
+            payload["results"]["sample"]["md_content"],
+            serde_json::Value::String("# office\n".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn zip_result_reads_office_output_dir() {
+        let temp = tempdir().expect("temp dir");
+        let parse_dir = temp.path().join("sample").join("office");
+        tokio::fs::create_dir_all(&parse_dir)
+            .await
+            .expect("office parse dir should be created");
+        tokio::fs::write(parse_dir.join("sample.md"), "# office\n")
+            .await
+            .expect("office markdown should write");
+        let mut task =
+            completed_zip_task(temp.path().to_path_buf(), temp.path().join("sample.docx"));
+        task.return_md = true;
+        task.return_original_file = false;
+        task.upload_suffixes = vec!["docx".to_string()];
+
+        let bytes = build_zip(&task).await.expect("zip bytes");
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("zip archive");
+        let mut markdown = archive
+            .by_name("sample/office/sample.md")
+            .expect("office markdown entry should exist");
+        let mut content = String::new();
+        markdown
+            .read_to_string(&mut content)
+            .expect("markdown should read");
+        assert_eq!(content, "# office\n");
+    }
+
+    #[tokio::test]
+    async fn office_original_is_zipped_as_original_file() {
+        let temp = tempdir().expect("temp dir");
+        let parse_dir = temp.path().join("sample").join("office");
+        tokio::fs::create_dir_all(&parse_dir)
+            .await
+            .expect("office parse dir should be created");
+        tokio::fs::write(parse_dir.join("sample.md"), "# office\n")
+            .await
+            .expect("office markdown should write");
+        let upload_path = temp.path().join("sample.docx");
+        tokio::fs::write(&upload_path, b"docx-bytes")
+            .await
+            .expect("original should write");
+        let mut task = completed_zip_task(temp.path().to_path_buf(), upload_path);
+        task.return_md = true;
+        task.return_original_file = true;
+        task.upload_suffixes = vec!["docx".to_string()];
+
+        let bytes = build_zip(&task).await.expect("zip bytes");
+        let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("zip archive");
+        assert!(archive.by_name("sample/vlm/sample_origin.pdf").is_err());
+        let mut original = archive
+            .by_name("sample/office/sample_origin.docx")
+            .expect("office original entry should exist");
+        let mut content = Vec::new();
+        original
+            .read_to_end(&mut content)
+            .expect("original should read");
+        assert_eq!(content, b"docx-bytes");
     }
 
     #[tokio::test]
