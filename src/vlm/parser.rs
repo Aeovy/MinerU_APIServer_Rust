@@ -1776,7 +1776,7 @@ mod tests {
             } else {
                 let active = state.active_layouts.fetch_add(1, Ordering::SeqCst) + 1;
                 state.max_active_layouts.fetch_max(active, Ordering::SeqCst);
-                let layout_delay_ms = if layout_call == 1 { 20 } else { 150 };
+                let layout_delay_ms = if layout_call == 1 { 300 } else { 600 };
                 sleep(Duration::from_millis(layout_delay_ms)).await;
                 state.active_layouts.fetch_sub(1, Ordering::SeqCst);
                 state.completed_layouts.fetch_add(1, Ordering::SeqCst);
