@@ -415,7 +415,7 @@ impl DocxStyleMap {
                         in_paragraph_style = false;
                         style_depth = 0;
                     } else if style_depth > 0 {
-                        style_depth -= 1;
+                        style_depth = style_depth.saturating_sub(1);
                     }
                 }
                 Ok(Event::Eof) => break,
