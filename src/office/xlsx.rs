@@ -9,7 +9,7 @@ use crate::{
     office::{
         markdown::to_parsed_document,
         model::{OfficeBlock, OfficeDocument, OfficePage},
-        writer_adapter::OfficeMediaWriter,
+        writer_adapter::{OfficeImageWrite, OfficeMediaWriter},
     },
 };
 
@@ -19,6 +19,7 @@ pub async fn parse_xlsx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
             .map_err(|error| ApiError::BadRequest(error.to_string()))?;
     let media_writer = OfficeMediaWriter::new(task, &upload.stem).await?;
     let mut images = Vec::new();
+    let mut warnings = Vec::new();
     if let Some(pictures) = workbook.pictures() {
         for (index, (extension, bytes)) in pictures.into_iter().enumerate() {
             let extension = if extension.trim().is_empty() {
@@ -27,8 +28,17 @@ pub async fn parse_xlsx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
                 extension.trim()
             };
             let file_name = format!("xlsx_image_{}.{}", index + 1, extension);
-            match media_writer.write_image(&file_name, &bytes).await {
-                Ok(image) => images.push(image),
+            match media_writer.write_image(&file_name, None, &bytes).await {
+                Ok(OfficeImageWrite::Written { image, warning }) => {
+                    if let Some(warning) = warning {
+                        warnings.push(warning);
+                    }
+                    images.push(image);
+                }
+                Ok(OfficeImageWrite::Skipped { reason, detail }) => {
+                    warnings.push(format!("{reason}: {detail}"));
+                    tracing::warn!(reason, detail, "skipped XLSX image");
+                }
                 Err(error) => {
                     tracing::warn!(error = %error.detail(), "failed to write XLSX image");
                 }
@@ -83,7 +93,7 @@ pub async fn parse_xlsx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
             blocks: images
                 .iter()
                 .map(|image| OfficeBlock::Image {
-                    path: image.file_name.clone(),
+                    path: image.display_path.clone(),
                     alt: "image".to_string(),
                 })
                 .collect(),
@@ -93,7 +103,7 @@ pub async fn parse_xlsx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
         for image in &images {
             if let Some(page) = pages.first_mut() {
                 page.blocks.push(OfficeBlock::Image {
-                    path: image.file_name.clone(),
+                    path: image.display_path.clone(),
                     alt: "image".to_string(),
                 });
             }
@@ -105,7 +115,8 @@ pub async fn parse_xlsx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
         images,
         model_output: json!({
             "type": "xlsx",
-            "source": upload.stem
+            "source": upload.stem,
+            "warnings": warnings
         }),
     };
     Ok(to_parsed_document(upload.stem.clone(), office_document))

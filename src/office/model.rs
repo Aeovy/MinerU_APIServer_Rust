@@ -31,7 +31,7 @@ pub enum OfficeBlock {
 
 #[derive(Debug, Clone)]
 pub struct OfficeImage {
-    pub file_name: String,
+    pub display_path: String,
     pub source_path: PathBuf,
 }
 

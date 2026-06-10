@@ -1,11 +1,11 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tokio::fs;
 
 use crate::{
     domain::models::ParseTask,
     error::{ApiError, ApiResult},
-    office::model::OfficeImage,
+    office::{image_serializer::serialize_office_image, model::OfficeImage},
 };
 
 pub struct OfficeMediaWriter {
@@ -23,19 +23,35 @@ impl OfficeMediaWriter {
     ///
     /// Inputs:
     /// - `suggested_name`: file name derived from the OOXML media part.
+    /// - `content_type`: optional OOXML content type for the media part.
     /// - `bytes`: image bytes extracted from the package.
-    pub async fn write_image(&self, suggested_name: &str, bytes: &[u8]) -> ApiResult<OfficeImage> {
-        let file_name = sanitize_file_name(suggested_name);
-        let path = self.unique_path(&file_name).await;
-        fs::write(&path, bytes).await?;
+    pub async fn write_image(
+        &self,
+        suggested_name: &str,
+        content_type: Option<&str>,
+        bytes: &[u8],
+    ) -> ApiResult<OfficeImageWrite> {
+        let Some(serialized) = serialize_office_image(suggested_name, content_type, bytes)? else {
+            return Ok(OfficeImageWrite::Skipped {
+                reason: "unsupported_image_format".to_string(),
+                detail: format!("Unsupported Office image format: {suggested_name}"),
+            });
+        };
+        let path = self.unique_path(&serialized.file_name).await;
+        fs::write(&path, &serialized.bytes).await?;
         let stored_name = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| ApiError::Internal("Office image path has no filename".to_string()))?
             .to_string();
-        Ok(OfficeImage {
-            file_name: stored_name,
+        let display_path = format!("images/{stored_name}");
+        let image = OfficeImage {
+            display_path,
             source_path: path,
+        };
+        Ok(OfficeImageWrite::Written {
+            image,
+            warning: serialized.warning,
         })
     }
 
@@ -44,17 +60,8 @@ impl OfficeMediaWriter {
         if !initial.exists() {
             return initial;
         }
-        let stem = Path::new(file_name)
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or("image");
-        let extension = Path::new(file_name)
-            .extension()
-            .and_then(|value| value.to_str())
-            .map(|value| format!(".{value}"))
-            .unwrap_or_default();
         for index in 2.. {
-            let candidate = self.directory.join(format!("{stem}_{index}{extension}"));
+            let candidate = self.directory.join(format!("{index}_{file_name}"));
             if !candidate.exists() {
                 return candidate;
             }
@@ -63,19 +70,14 @@ impl OfficeMediaWriter {
     }
 }
 
-fn sanitize_file_name(value: &str) -> String {
-    let file_name = Path::new(value)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("image");
-    if file_name.trim().is_empty() {
-        return "image".to_string();
-    }
-    file_name
-        .chars()
-        .map(|ch| match ch {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
-            _ => ch,
-        })
-        .collect()
+#[derive(Debug)]
+pub enum OfficeImageWrite {
+    Written {
+        image: OfficeImage,
+        warning: Option<String>,
+    },
+    Skipped {
+        reason: String,
+        detail: String,
+    },
 }

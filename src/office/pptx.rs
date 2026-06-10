@@ -11,7 +11,7 @@ use crate::{
         model::{OfficeBlock, OfficeDocument, OfficeImage, OfficePage},
         package::{local_name, OoxmlPackage},
         rels::{read_relationships, relationship_target_part},
-        writer_adapter::OfficeMediaWriter,
+        writer_adapter::{OfficeImageWrite, OfficeMediaWriter},
     },
 };
 
@@ -32,10 +32,12 @@ pub async fn parse_pptx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
     let slide_size = slide_size(&package)?;
     let mut pages = Vec::new();
     let mut images = Vec::new();
+    let mut warnings = Vec::new();
     for (page_idx, slide_part) in slide_parts.iter().enumerate() {
-        let (mut blocks, mut page_images) =
+        let (mut blocks, mut page_images, mut page_warnings) =
             parse_slide(&package, &media_writer, slide_part, slide_size).await?;
         images.append(&mut page_images);
+        warnings.append(&mut page_warnings);
         if let Some(notes_part) = notes_part_for_slide(&package, slide_part)? {
             let notes = parse_notes(&package, &notes_part)?;
             if !notes.trim().is_empty() {
@@ -56,7 +58,8 @@ pub async fn parse_pptx(task: &ParseTask, upload: &StoredUpload) -> ApiResult<Pa
         images,
         model_output: json!({
             "type": "pptx",
-            "source": upload.stem
+            "source": upload.stem,
+            "warnings": warnings
         }),
     };
     Ok(to_parsed_document(upload.stem.clone(), office_document))
@@ -127,7 +130,7 @@ async fn parse_slide(
     media_writer: &OfficeMediaWriter,
     slide_part: &str,
     slide_size: Option<PptSlideSize>,
-) -> ApiResult<(Vec<OfficeBlock>, Vec<OfficeImage>)> {
+) -> ApiResult<(Vec<OfficeBlock>, Vec<OfficeImage>, Vec<String>)> {
     let xml = package.read_text(slide_part)?;
     let mut reader = quick_xml::Reader::from_str(&xml);
     reader.config_mut().trim_text(false);
@@ -301,12 +304,16 @@ async fn parse_slide(
     items.sort_by_key(PptSlideItem::sort_key);
     let mut blocks = Vec::new();
     let mut images = Vec::new();
+    let mut warnings = Vec::new();
     for item in items {
         match item.block {
             PptItemBlock::Text(content) => push_text_block(&mut blocks, content),
             PptItemBlock::Table(html) => blocks.push(OfficeBlock::Table { html }),
-            PptItemBlock::Image(image) => {
-                let path = image.file_name.clone();
+            PptItemBlock::Image { image, warning } => {
+                if let Some(warning) = warning {
+                    warnings.push(warning);
+                }
+                let path = image.display_path.clone();
                 images.push(image);
                 blocks.push(OfficeBlock::Image {
                     path,
@@ -316,7 +323,7 @@ async fn parse_slide(
             PptItemBlock::Chart(html) => blocks.push(OfficeBlock::Chart { html }),
         }
     }
-    Ok((blocks, images))
+    Ok((blocks, images, warnings))
 }
 
 fn parse_notes(package: &OoxmlPackage, notes_part: &str) -> ApiResult<String> {
@@ -570,9 +577,9 @@ impl PptElementState {
             return extract_pptx_image(package, media_writer, slide_part, &rel_id)
                 .await
                 .map(|image| {
-                    image.map(|image| PptElementOutput {
+                    image.map(|(image, warning)| PptElementOutput {
                         transform,
-                        block: PptItemBlock::Image(image),
+                        block: PptItemBlock::Image { image, warning },
                     })
                 });
         }
@@ -635,7 +642,10 @@ impl PptSlideItem {
 enum PptItemBlock {
     Text(String),
     Table(String),
-    Image(OfficeImage),
+    Image {
+        image: OfficeImage,
+        warning: Option<String>,
+    },
     Chart(String),
 }
 
@@ -662,7 +672,7 @@ async fn extract_pptx_image(
     media_writer: &OfficeMediaWriter,
     slide_part: &str,
     rel_id: &str,
-) -> ApiResult<Option<OfficeImage>> {
+) -> ApiResult<Option<(OfficeImage, Option<String>)>> {
     let Some(part) = relationship_target_part(package, slide_part, rel_id)? else {
         tracing::warn!(rel_id, slide_part, "PPTX image relationship target missing");
         return Ok(None);
@@ -675,8 +685,15 @@ async fn extract_pptx_image(
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("image");
-    match media_writer.write_image(suggested_name, bytes).await {
-        Ok(image) => Ok(Some(image)),
+    match media_writer
+        .write_image(suggested_name, package.content_type(&part), bytes)
+        .await
+    {
+        Ok(OfficeImageWrite::Written { image, warning }) => Ok(Some((image, warning))),
+        Ok(OfficeImageWrite::Skipped { reason, detail }) => {
+            tracing::warn!(reason, detail, "skipped PPTX image");
+            Ok(None)
+        }
         Err(error) => {
             tracing::warn!(error = %error.detail(), "failed to write PPTX image");
             Ok(None)

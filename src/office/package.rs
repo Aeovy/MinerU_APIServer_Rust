@@ -2,6 +2,8 @@ use std::{collections::HashMap, fs::File, io::Read, path::Path};
 
 use zip::ZipArchive;
 
+use quick_xml::events::Event;
+
 use crate::error::{ApiError, ApiResult};
 
 const MAX_OOXML_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
@@ -9,6 +11,8 @@ const MAX_OOXML_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
 pub struct OoxmlPackage {
     files: HashMap<String, Vec<u8>>,
+    content_types: HashMap<String, String>,
+    default_content_types: HashMap<String, String>,
 }
 
 impl OoxmlPackage {
@@ -51,7 +55,13 @@ impl OoxmlPackage {
                 "Invalid OOXML package: missing [Content_Types].xml".to_string(),
             ));
         }
-        Ok(Self { files })
+        let (content_types, default_content_types) =
+            parse_content_types(files.get("[Content_Types].xml").expect("checked above"))?;
+        Ok(Self {
+            files,
+            content_types,
+            default_content_types,
+        })
     }
 
     pub fn read_text(&self, name: &str) -> ApiResult<String> {
@@ -74,6 +84,19 @@ impl OoxmlPackage {
 
     pub fn part_names(&self) -> impl Iterator<Item = &str> {
         self.files.keys().map(String::as_str)
+    }
+
+    pub fn content_type(&self, name: &str) -> Option<&str> {
+        let normalized = normalize_part_name(name);
+        self.content_types
+            .get(&normalized)
+            .or_else(|| {
+                Path::new(&normalized)
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .and_then(|extension| self.default_content_types.get(extension))
+            })
+            .map(String::as_str)
     }
 }
 
@@ -120,6 +143,72 @@ fn normalize_posix_path(path: &Path) -> String {
         parts.push(value.to_string());
     }
     parts.join("/")
+}
+
+fn parse_content_types(
+    bytes: &[u8],
+) -> ApiResult<(HashMap<String, String>, HashMap<String, String>)> {
+    let mut reader = quick_xml::Reader::from_reader(std::io::Cursor::new(bytes));
+    reader.config_mut().trim_text(true);
+    let mut buffer = Vec::new();
+    let mut overrides = HashMap::new();
+    let mut defaults = HashMap::new();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) | Ok(Event::Empty(event)) => {
+                match local_name(event.name().as_ref()) {
+                    b"Override" => {
+                        let mut part_name = None;
+                        let mut content_type = None;
+                        for attr in event.attributes().flatten() {
+                            let value = attr
+                                .decoded_and_normalized_value(
+                                    quick_xml::XmlVersion::Implicit1_0,
+                                    reader.decoder(),
+                                )
+                                .map_err(|error| ApiError::BadRequest(error.to_string()))?
+                                .into_owned();
+                            match local_name(attr.key.as_ref()) {
+                                b"PartName" => part_name = Some(normalize_part_name(&value)),
+                                b"ContentType" => content_type = Some(value),
+                                _ => {}
+                            }
+                        }
+                        if let (Some(part_name), Some(content_type)) = (part_name, content_type) {
+                            overrides.insert(part_name, content_type);
+                        }
+                    }
+                    b"Default" => {
+                        let mut extension = None;
+                        let mut content_type = None;
+                        for attr in event.attributes().flatten() {
+                            let value = attr
+                                .decoded_and_normalized_value(
+                                    quick_xml::XmlVersion::Implicit1_0,
+                                    reader.decoder(),
+                                )
+                                .map_err(|error| ApiError::BadRequest(error.to_string()))?
+                                .into_owned();
+                            match local_name(attr.key.as_ref()) {
+                                b"Extension" => extension = Some(value.to_ascii_lowercase()),
+                                b"ContentType" => content_type = Some(value),
+                                _ => {}
+                            }
+                        }
+                        if let (Some(extension), Some(content_type)) = (extension, content_type) {
+                            defaults.insert(extension, content_type);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(ApiError::BadRequest(error.to_string())),
+        }
+        buffer.clear();
+    }
+    Ok((overrides, defaults))
 }
 
 #[cfg(test)]

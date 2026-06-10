@@ -1,4 +1,5 @@
 pub mod docx;
+pub mod image_serializer;
 pub mod inline;
 pub mod markdown;
 pub mod model;
@@ -78,7 +79,7 @@ mod tests {
                     "word/_rels/document.xml.rels",
                     br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.png"/></Relationships>"#.as_slice(),
                 ),
-                ("word/media/image1.png", b"png-bytes".as_slice()),
+                ("word/media/image1.png", png_bytes()),
             ],
         );
         let task = task_for_upload(temp.path().to_path_buf(), &upload_path, "docx");
@@ -160,6 +161,64 @@ mod tests {
             .as_str()
             .expect("warning should be string")
             .contains("missing_image_part"));
+    }
+
+    #[tokio::test]
+    async fn parses_docx_styles_outline_lists_and_vector_placeholders() {
+        let temp = tempdir().expect("tempdir");
+        let upload_path = temp.path().join("styled.docx");
+        write_zip(
+            &upload_path,
+            &[
+                (
+                    "[Content_Types].xml",
+                    br#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="emf" ContentType="image/x-emf"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/></Types>"#.as_slice(),
+                ),
+                (
+                    "word/styles.xml",
+                    br#"<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/></w:style><w:style w:type="paragraph" w:styleId="CustomTitle"><w:name w:val="Custom Title"/><w:basedOn w:val="Heading1"/></w:style><w:style w:type="paragraph" w:styleId="Outline3"><w:pPr><w:outlineLvl w:val="2"/></w:pPr></w:style></w:styles>"#.as_slice(),
+                ),
+                (
+                    "word/document.xml",
+                    br#"<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body><w:p><w:pPr><w:pStyle w:val="CustomTitle"/><w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr><w:r><w:t>Custom Heading</w:t></w:r></w:p><w:p><w:pPr><w:pStyle w:val="Outline3"/></w:pPr><w:r><w:t>Outline Heading</w:t></w:r></w:p><w:p><w:pPr><w:numPr><w:ilvl w:val="0"/></w:numPr></w:pPr><w:r><w:t>List Item</w:t></w:r></w:p><w:p><w:r><w:drawing><a:blip r:embed="rEmf"/></w:drawing></w:r></w:p></w:body></w:document>"#.as_slice(),
+                ),
+                (
+                    "word/_rels/document.xml.rels",
+                    br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rEmf" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="media/image1.emf"/></Relationships>"#.as_slice(),
+                ),
+                ("word/media/image1.emf", b"emf-bytes".as_slice()),
+            ],
+        );
+        let task = task_for_upload(temp.path().to_path_buf(), &upload_path, "docx");
+        let parser = OfficeDocumentParser::new();
+        let document = parser
+            .parse_upload(
+                &task,
+                &StoredUpload {
+                    stem: "styled".to_string(),
+                    path: upload_path,
+                    suffix: "docx".to_string(),
+                },
+            )
+            .await
+            .expect("docx should parse");
+
+        assert!(document.markdown.contains("# Custom Heading"));
+        assert!(document.markdown.contains("### Outline Heading"));
+        assert!(document.markdown.contains("- List Item"));
+        assert!(!document.markdown.contains(".emf"));
+        assert!(document.markdown.contains("](images/"));
+        assert_eq!(document.image_files.len(), 1);
+        let image_name = document.image_files[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("image file name");
+        assert!(image_name.ends_with(".jpg"));
+        assert!(!image_name.contains("image1"));
+        assert!(document.model_output["warnings"][0]
+            .as_str()
+            .expect("warning should be string")
+            .contains("EMF"));
     }
 
     #[tokio::test]
@@ -248,8 +307,8 @@ mod tests {
                     "ppt/slides/_rels/slide1.xml.rels",
                     br#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rBg" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/background.png"/><Relationship Id="rTiny" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/tiny.png"/></Relationships>"#.as_slice(),
                 ),
-                ("ppt/media/background.png", b"background-bytes".as_slice()),
-                ("ppt/media/tiny.png", b"tiny-bytes".as_slice()),
+                ("ppt/media/background.png", png_bytes()),
+                ("ppt/media/tiny.png", png_bytes()),
             ],
         );
         let task = task_for_upload(temp.path().to_path_buf(), &upload_path, "pptx");
@@ -372,5 +431,13 @@ mod tests {
             completed_at: None,
             error: None,
         }
+    }
+
+    fn png_bytes() -> &'static [u8] {
+        &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248, 15, 4,
+            0, 9, 251, 3, 253, 160, 152, 198, 53, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ]
     }
 }
