@@ -15,7 +15,15 @@ pub struct OfficeMediaWriter {
 impl OfficeMediaWriter {
     pub async fn new(task: &ParseTask, file_name: &str) -> ApiResult<Self> {
         let directory = task.output_dir.join("_office_media").join(file_name);
-        fs::create_dir_all(&directory).await?;
+        fs::create_dir_all(&directory).await.map_err(|error| {
+            ApiError::internal_context(
+                format!(
+                    "Failed to create Office media directory: {}",
+                    directory.display()
+                ),
+                error,
+            )
+        })?;
         Ok(Self { directory })
     }
 
@@ -38,7 +46,16 @@ impl OfficeMediaWriter {
             });
         };
         let path = self.unique_path(&serialized.file_name).await;
-        fs::write(&path, &serialized.bytes).await?;
+        fs::write(&path, &serialized.bytes).await.map_err(|error| {
+            ApiError::internal_context(
+                format!(
+                    "Failed to write serialized Office image {} to {}",
+                    suggested_name,
+                    path.display()
+                ),
+                error,
+            )
+        })?;
         let stored_name = path
             .file_name()
             .and_then(|name| name.to_str())

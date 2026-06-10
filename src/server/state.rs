@@ -34,7 +34,15 @@ impl AppState {
         let config = ServiceConfig::from_args(&args);
         fs::create_dir_all(&config.output_root)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(|error| {
+                ApiError::internal_context(
+                    format!(
+                        "Failed to create configured output root: {}",
+                        config.output_root.display()
+                    ),
+                    error,
+                )
+            })?;
         let task_manager = Arc::new(TaskManager::new(config.task_retention));
         let client = Arc::new(VlmHttpClient::new());
         let vlm_scheduler = VlmRequestScheduler::new(

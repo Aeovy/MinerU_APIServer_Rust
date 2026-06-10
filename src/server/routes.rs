@@ -327,7 +327,17 @@ async fn create_async_parse_task(state: &AppState, multipart: Multipart) -> ApiR
     let task_id = Uuid::new_v4();
     let task_output_dir = state.create_task_output_dir(task_id);
     let uploads_dir = task_output_dir.join("uploads");
-    tokio::fs::create_dir_all(&uploads_dir).await?;
+    tokio::fs::create_dir_all(&uploads_dir)
+        .await
+        .map_err(|error| {
+            ApiError::internal_context(
+                format!(
+                    "Failed to create task upload directory: {}",
+                    uploads_dir.display()
+                ),
+                error,
+            )
+        })?;
     let multipart_started_at = Instant::now();
     let (options, mut uploads) = parse_multipart(multipart, UploadStore::new(uploads_dir)).await?;
     let multipart_elapsed_ms = multipart_started_at.elapsed().as_millis();
@@ -424,10 +434,9 @@ fn spawn_task_processor(state: AppState, task: ParseTask, admission_permit: Owne
         let permit = match state.request_semaphore().acquire_owned().await {
             Ok(permit) => permit,
             Err(error) => {
-                state
-                    .task_manager()
-                    .set_failed(task_id, error.to_string())
-                    .await;
+                let detail = format!("Failed to acquire request permit: {error}");
+                tracing::error!(%task_id, error = %detail, "parse task failed before processing");
+                state.task_manager().set_failed(task_id, detail).await;
                 memory::reclaim_after_task(task_id, state.config().memory_reclaim_after_task);
                 return;
             }
@@ -456,15 +465,18 @@ fn spawn_task_processor(state: AppState, task: ParseTask, admission_permit: Owne
                     .await
             }
             Err(error) => {
-                tracing::debug!(
+                let error_type = error.kind();
+                let detail = error.detail();
+                tracing::error!(
                     %task_id,
                     parse_ms = parse_elapsed_ms,
-                    error = %error.detail(),
+                    error_type,
+                    error = %detail,
                     "parse task failed"
                 );
                 state
                     .task_manager()
-                    .set_failed(task_id, error.detail())
+                    .set_failed(task_id, format!("{error_type}: {detail}"))
                     .await
             }
         }

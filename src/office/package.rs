@@ -21,23 +21,39 @@ impl OoxmlPackage {
     /// Inputs:
     /// - `path`: path to an uploaded docx, pptx, or xlsx file.
     pub fn open(path: &Path) -> ApiResult<Self> {
-        let file = File::open(path).map_err(ApiError::from)?;
-        let mut archive =
-            ZipArchive::new(file).map_err(|error| ApiError::BadRequest(error.to_string()))?;
+        let file = File::open(path).map_err(|error| {
+            ApiError::internal_context(
+                format!("Failed to open OOXML upload: {}", path.display()),
+                error,
+            )
+        })?;
+        let mut archive = ZipArchive::new(file).map_err(|error| {
+            ApiError::bad_request_context(
+                format!("Invalid OOXML zip package: {}", path.display()),
+                error,
+            )
+        })?;
         let mut files = HashMap::new();
         let mut total_size = 0_u64;
         for index in 0..archive.len() {
-            let mut entry = archive
-                .by_index(index)
-                .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+            let mut entry = archive.by_index(index).map_err(|error| {
+                ApiError::bad_request_context(
+                    format!(
+                        "Failed to read OOXML zip entry #{index}: {}",
+                        path.display()
+                    ),
+                    error,
+                )
+            })?;
             if entry.is_dir() {
                 continue;
             }
+            let entry_name = entry.name().to_string();
             let entry_size = entry.size();
             if entry_size > MAX_OOXML_ENTRY_BYTES {
                 return Err(ApiError::BadRequest(format!(
                     "OOXML entry is too large: {}",
-                    entry.name()
+                    entry_name
                 )));
             }
             total_size = total_size.saturating_add(entry_size);
@@ -47,8 +63,13 @@ impl OoxmlPackage {
                 ));
             }
             let mut bytes = Vec::with_capacity(entry_size.min(usize::MAX as u64) as usize);
-            entry.read_to_end(&mut bytes).map_err(ApiError::from)?;
-            files.insert(normalize_part_name(entry.name()), bytes);
+            entry.read_to_end(&mut bytes).map_err(|error| {
+                ApiError::internal_context(
+                    format!("Failed to read OOXML entry bytes: {entry_name}"),
+                    error,
+                )
+            })?;
+            files.insert(normalize_part_name(&entry_name), bytes);
         }
         if !files.contains_key("[Content_Types].xml") {
             return Err(ApiError::BadRequest(

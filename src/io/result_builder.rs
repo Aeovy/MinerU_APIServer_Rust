@@ -256,8 +256,24 @@ fn build_zip_to_writer<W: Write>(task: &ParseTask, writer: W) -> ApiResult<W> {
         if task.return_images {
             let images_dir = parse_dir.join("images");
             if images_dir.is_dir() {
-                for entry in std::fs::read_dir(&images_dir).map_err(ApiError::from)? {
-                    let entry = entry.map_err(ApiError::from)?;
+                for entry in std::fs::read_dir(&images_dir).map_err(|error| {
+                    ApiError::internal_context(
+                        format!(
+                            "Failed to read result images directory: {}",
+                            images_dir.display()
+                        ),
+                        error,
+                    )
+                })? {
+                    let entry = entry.map_err(|error| {
+                        ApiError::internal_context(
+                            format!(
+                                "Failed to read result image directory entry: {}",
+                                images_dir.display()
+                            ),
+                            error,
+                        )
+                    })?;
                     let path = entry.path();
                     if path.is_file() {
                         let relative = format!(
@@ -288,7 +304,9 @@ fn build_zip_to_writer<W: Write>(task: &ParseTask, writer: W) -> ApiResult<W> {
         );
     }
     let mut writer = writer.finish()?;
-    writer.flush().map_err(ApiError::from)?;
+    writer
+        .flush()
+        .map_err(|error| ApiError::internal_context("Failed to flush ZIP response", error))?;
     tracing::debug!(
         task_id = %task.task_id,
         file_count = task.file_names.len(),
@@ -350,7 +368,15 @@ fn add_original_file<W: Write>(
         return add_path_as_file(writer, upload_path, &arcname);
     }
     let arcname = format!("{file_name}/vlm/{file_name}_origin.pdf");
-    let source_bytes = std::fs::read(upload_path).map_err(ApiError::from)?;
+    let source_bytes = std::fs::read(upload_path).map_err(|error| {
+        ApiError::internal_context(
+            format!(
+                "Failed to read uploaded image for original-file PDF conversion: {}",
+                upload_path.display()
+            ),
+            error,
+        )
+    })?;
     let bytes = image_to_pdf_bytes(&source_bytes)?;
     writer.add_bytes(&arcname, &bytes)
 }
@@ -360,7 +386,15 @@ fn add_path_as_file<W: Write>(
     path: &Path,
     arcname: &str,
 ) -> ApiResult<()> {
-    let mut source = std::fs::File::open(path).map_err(ApiError::from)?;
+    let mut source = std::fs::File::open(path).map_err(|error| {
+        ApiError::internal_context(
+            format!(
+                "Failed to open ZIP source file for {arcname}: {}",
+                path.display()
+            ),
+            error,
+        )
+    })?;
     writer.add_reader(arcname, &mut source)
 }
 
@@ -406,7 +440,12 @@ impl<W: Write> StreamingZipWriter<W> {
         let mut uncompressed_size = 0_u64;
         let mut buffer = vec![0_u8; ZIP_STREAM_CHUNK_SIZE];
         loop {
-            let read = reader.read(&mut buffer).map_err(ApiError::from)?;
+            let read = reader.read(&mut buffer).map_err(|error| {
+                ApiError::internal_context(
+                    format!("Failed to read ZIP entry source: {arcname}"),
+                    error,
+                )
+            })?;
             if read == 0 {
                 break;
             }
@@ -520,7 +559,9 @@ impl<W: Write> StreamingZipWriter<W> {
     }
 
     fn write_counted(&mut self, bytes: &[u8]) -> ApiResult<()> {
-        self.inner.write_all(bytes).map_err(ApiError::from)?;
+        self.inner.write_all(bytes).map_err(|error| {
+            ApiError::internal_context("Failed to write ZIP response bytes", error)
+        })?;
         self.position += bytes.len() as u64;
         Ok(())
     }
@@ -611,7 +652,14 @@ async fn read_text(path: PathBuf) -> ApiResult<Value> {
     if !path.exists() {
         return Ok(Value::Null);
     }
-    Ok(Value::String(fs::read_to_string(path).await?))
+    Ok(Value::String(fs::read_to_string(&path).await.map_err(
+        |error| {
+            ApiError::internal_context(
+                format!("Failed to read result text file: {}", path.display()),
+                error,
+            )
+        },
+    )?))
 }
 
 async fn read_images(images_dir: &Path) -> ApiResult<Value> {
@@ -619,8 +667,24 @@ async fn read_images(images_dir: &Path) -> ApiResult<Value> {
     if !images_dir.is_dir() {
         return Ok(Value::Object(images));
     }
-    let mut entries = fs::read_dir(images_dir).await?;
-    while let Some(entry) = entries.next_entry().await? {
+    let mut entries = fs::read_dir(images_dir).await.map_err(|error| {
+        ApiError::internal_context(
+            format!(
+                "Failed to read result images directory: {}",
+                images_dir.display()
+            ),
+            error,
+        )
+    })?;
+    while let Some(entry) = entries.next_entry().await.map_err(|error| {
+        ApiError::internal_context(
+            format!(
+                "Failed to iterate result images directory: {}",
+                images_dir.display()
+            ),
+            error,
+        )
+    })? {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -633,7 +697,12 @@ async fn read_images(images_dir: &Path) -> ApiResult<Value> {
         let mime = mime_guess::from_path(&path)
             .first_raw()
             .unwrap_or("image/jpeg");
-        let bytes = fs::read(path).await?;
+        let bytes = fs::read(&path).await.map_err(|error| {
+            ApiError::internal_context(
+                format!("Failed to read result image file: {}", path.display()),
+                error,
+            )
+        })?;
         images.insert(
             name,
             Value::String(format!("data:{mime};base64,{}", STANDARD.encode(bytes))),

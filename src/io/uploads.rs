@@ -30,7 +30,17 @@ impl UploadStore {
     /// Inputs:
     /// - `field`: multipart file field named `files`.
     pub async fn save_field(&self, mut field: Field<'_>) -> ApiResult<StoredUpload> {
-        fs::create_dir_all(&self.upload_dir).await?;
+        fs::create_dir_all(&self.upload_dir)
+            .await
+            .map_err(|error| {
+                ApiError::internal_context(
+                    format!(
+                        "Failed to create upload directory: {}",
+                        self.upload_dir.display()
+                    ),
+                    error,
+                )
+            })?;
         let original_name = field.file_name().map(ToOwned::to_owned).ok_or_else(|| {
             ApiError::BadRequest(
                 "Field 'files' must be uploaded as a file. Use curl syntax like -F 'files=@/path/to/document.pdf;type=application/pdf' or upload docx/pptx/xlsx Office OOXML files.".to_string(),
@@ -47,11 +57,29 @@ impl UploadStore {
             )));
         }
         let destination = self.unique_destination(&filename).await;
-        let mut output = fs::File::create(&destination).await?;
+        let mut output = fs::File::create(&destination).await.map_err(|error| {
+            ApiError::internal_context(
+                format!(
+                    "Failed to create uploaded file destination: {}",
+                    destination.display()
+                ),
+                error,
+            )
+        })?;
         while let Some(chunk) = field.chunk().await.map_err(ApiError::from)? {
-            output.write_all(&chunk).await?;
+            output.write_all(&chunk).await.map_err(|error| {
+                ApiError::internal_context(
+                    format!("Failed to write uploaded file: {}", destination.display()),
+                    error,
+                )
+            })?;
         }
-        output.flush().await?;
+        output.flush().await.map_err(|error| {
+            ApiError::internal_context(
+                format!("Failed to flush uploaded file: {}", destination.display()),
+                error,
+            )
+        })?;
 
         Ok(StoredUpload {
             stem: normalize_task_stem(file_stem(&filename).unwrap_or_default()),

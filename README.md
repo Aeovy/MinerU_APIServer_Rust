@@ -98,6 +98,7 @@ MINERU_API_OUTPUT_ROOT=/app/output
 ```
 
 运行容器时建议把 `/app/output` 挂载到宿主机目录，方便保留上传文件、中间结果和解析输出。
+容器启动入口会自动创建并授权 `MINERU_API_OUTPUT_ROOT` 指向的目录，避免挂载宿主机空目录后非 root 服务进程无法写入。
 
 ### 2. 构建二进制和镜像
 

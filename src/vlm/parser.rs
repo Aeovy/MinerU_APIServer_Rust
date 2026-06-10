@@ -763,17 +763,39 @@ impl VlmDocumentParser {
         image_png: &[u8],
     ) -> ApiResult<PathBuf> {
         let image_dir = task.output_dir.join("_pending_images");
-        fs::create_dir_all(&image_dir).await?;
+        fs::create_dir_all(&image_dir).await.map_err(|error| {
+            ApiError::internal_context(
+                format!(
+                    "Failed to create pending image directory: {}",
+                    image_dir.display()
+                ),
+                error,
+            )
+        })?;
         let path = image_dir.join(format!("page_{page_index}_block_{block_index}.png"));
-        fs::write(&path, image_png).await?;
+        fs::write(&path, image_png).await.map_err(|error| {
+            ApiError::internal_context(
+                format!("Failed to write pending image file: {}", path.display()),
+                error,
+            )
+        })?;
         Ok(path)
     }
 
     async fn load_image_pages(&self, upload: &StoredUpload) -> ApiResult<Vec<RenderedPage>> {
         let started_at = Instant::now();
-        let bytes = fs::read(&upload.path).await?;
-        let image = image::load_from_memory(&bytes)
-            .map_err(|error| ApiError::BadRequest(format!("Failed to load image: {error}")))?;
+        let bytes = fs::read(&upload.path).await.map_err(|error| {
+            ApiError::internal_context(
+                format!("Failed to read uploaded image: {}", upload.path.display()),
+                error,
+            )
+        })?;
+        let image = image::load_from_memory(&bytes).map_err(|error| {
+            ApiError::BadRequest(format!(
+                "Failed to decode uploaded image {}: {error}",
+                upload.path.display()
+            ))
+        })?;
         tracing::debug!(
             file_name = %upload.stem,
             byte_len = bytes.len(),
@@ -975,9 +997,9 @@ fn render_pdf_page_window(
     processing_window_size: usize,
 ) -> ApiResult<RenderedPageWindow> {
     let pdfium = bind_pdfium()?;
-    let document = pdfium
-        .load_pdf_from_file(path, None)
-        .map_err(|error| ApiError::BadRequest(format!("Failed to open PDF: {error}")))?;
+    let document = pdfium.load_pdf_from_file(path, None).map_err(|error| {
+        ApiError::BadRequest(format!("Failed to open PDF {}: {error}", path.display()))
+    })?;
     let page_count = document.pages().len() as usize;
     let Some((start, window_end, next_page_id)) = pdf_page_window_bounds(
         page_count,
@@ -992,10 +1014,15 @@ fn render_pdf_page_window(
     };
     let mut images = Vec::new();
     for page_index in start..=window_end {
-        let page = document
-            .pages()
-            .get(page_index as u16)
-            .map_err(|error| ApiError::Internal(error.to_string()))?;
+        let page = document.pages().get(page_index as u16).map_err(|error| {
+            ApiError::internal_context(
+                format!(
+                    "Failed to get PDF page {page_index} from {}",
+                    path.display()
+                ),
+                error,
+            )
+        })?;
         let point_width = page.width().value.round().max(1.0) as u32;
         let point_height = page.height().value.round().max(1.0) as u32;
         let width = ((page.width().value / 72.0) * DEFAULT_PDF_IMAGE_DPI).round() as i32;
@@ -1006,7 +1033,15 @@ fn render_pdf_page_window(
                     .set_target_width(width.max(1))
                     .set_target_height(height.max(1)),
             )
-            .map_err(|error| ApiError::Internal(error.to_string()))?
+            .map_err(|error| {
+                ApiError::internal_context(
+                    format!(
+                        "Failed to render PDF page {page_index} from {}",
+                        path.display()
+                    ),
+                    error,
+                )
+            })?
             .as_image();
         images.push(RenderedPage {
             page_index,

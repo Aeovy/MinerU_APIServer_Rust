@@ -1,7 +1,7 @@
 FROM ubuntu:22.04
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && apt-get install -y --no-install-recommends ca-certificates curl gosu \
     && rm -rf /var/lib/apt/lists/*
 
 RUN groupadd --system mineru \
@@ -10,6 +10,9 @@ RUN groupadd --system mineru \
     && chown -R mineru:mineru /app
 
 COPY target/release/mineru-rust /usr/local/bin/mineru-rust
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+
+RUN chmod 0755 /usr/local/bin/docker-entrypoint.sh
 
 ENV MINERU_API_OUTPUT_ROOT=/app/output
 
@@ -22,6 +25,5 @@ VOLUME ["/app/output"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl --fail --silent --show-error http://127.0.0.1:34001/health > /dev/null || exit 1
 
-USER mineru
-
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["mineru-rust", "--host", "0.0.0.0", "--port", "34001", "--allow-public-http-client"]
