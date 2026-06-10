@@ -208,6 +208,48 @@ mod tests {
         assert!(document.markdown.contains("- List Item"));
         assert!(!document.markdown.contains(".emf"));
         assert!(document.markdown.contains("](images/"));
+        assert!(document
+            .content_list
+            .as_array()
+            .expect("content list should be an array")
+            .iter()
+            .any(|item| item["type"] == "text"
+                && item["text"] == "Custom Heading"
+                && item["text_level"] == 1));
+        assert!(document
+            .content_list
+            .as_array()
+            .expect("content list should be an array")
+            .iter()
+            .any(|item| item["type"] == "list"
+                && item["list_items"][0] == "List Item"
+                && item["page_idx"] == 0));
+        assert!(document
+            .content_list
+            .as_array()
+            .expect("content list should be an array")
+            .iter()
+            .any(|item| item["type"] == "image"
+                && item["img_path"]
+                    .as_str()
+                    .expect("image path should be string")
+                    .starts_with("images/")
+                && item["page_idx"] == 0));
+        let first_page = document.content_list_v2[0]
+            .as_array()
+            .expect("content list v2 page should be an array");
+        assert!(first_page.iter().any(|item| item["type"] == "title"
+            && item["content"]["level"] == 1
+            && item["content"]["title_content"][0]["content"] == "Custom Heading"));
+        assert!(first_page.iter().any(|item| item["type"] == "list"
+            && item["content"]["attribute"] == "unordered"
+            && item["content"]["list_items"][0]["prefix"] == "-"
+            && item["content"]["list_items"][0]["item_content"][0]["content"] == "List Item"));
+        assert!(first_page.iter().any(|item| item["type"] == "image"
+            && item["content"]["image_source"]["path"]
+                .as_str()
+                .expect("v2 image path should be string")
+                .starts_with("images/")));
         assert_eq!(document.image_files.len(), 1);
         let image_name = document.image_files[0]
             .file_name()

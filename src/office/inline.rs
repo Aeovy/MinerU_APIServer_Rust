@@ -114,7 +114,7 @@ pub fn parse_inline_spans(content: &str) -> Vec<InlineSpan> {
             }
         }
     }
-    spans
+    merge_adjacent_text_spans(spans)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +205,26 @@ fn push_plain_text(spans: &mut Vec<InlineSpan>, content: &str) {
     });
 }
 
+fn merge_adjacent_text_spans(spans: Vec<InlineSpan>) -> Vec<InlineSpan> {
+    let mut merged: Vec<InlineSpan> = Vec::new();
+    for span in spans {
+        match (merged.last_mut(), span) {
+            (
+                Some(InlineSpan::Text {
+                    content,
+                    styles: existing_styles,
+                }),
+                InlineSpan::Text {
+                    content: next_content,
+                    styles: next_styles,
+                },
+            ) if *existing_styles == next_styles => content.push_str(&next_content),
+            (_, other) => merged.push(other),
+        }
+    }
+    merged
+}
+
 pub fn decode_basic_entities(value: &str) -> String {
     value
         .replace("&quot;", "\"")
@@ -249,6 +269,26 @@ mod tests {
                     content: "site".to_string(),
                     url: "https://example.com?a=1&b=2".to_string(),
                     styles: vec!["underline".to_string()]
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn merges_adjacent_text_spans_with_same_style() {
+        let spans =
+            parse_inline_spans(r#"<text style="bold">A</text><text style="bold">B</text>C"#);
+
+        assert_eq!(
+            spans,
+            vec![
+                InlineSpan::Text {
+                    content: "AB".to_string(),
+                    styles: vec!["bold".to_string()]
+                },
+                InlineSpan::Text {
+                    content: "C".to_string(),
+                    styles: Vec::new()
                 },
             ]
         );
